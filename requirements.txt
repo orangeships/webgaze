@@ -1,0 +1,8 @@
+openvino-dev==2022.3
+pandas>=1.3.0
+matplotlib>=3.4.0
+opencv-python>=4.5.0,<4.6.0
+scipy>=1.11.1  # 升级以兼容 JAX 依赖
+scikit-image>=0.18.0
+screeninfo>=0.6.0
+keyboard>=0.13.5
