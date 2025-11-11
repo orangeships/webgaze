@@ -29,6 +29,15 @@ class SFM():
         self.width, self.height, self.width_mm, self.height_mm = getScreenSize()
         self.S_T_W = np.array([[-1,0,0,self.width/2],[0,1,0,0],[0,0,-1,0],[0,0,0,1]])
         
+        # 初始化缓存机制
+        # 1. 人脸检测结果缓存
+        self.face_detection_cache_prev = None  # 上一帧人脸检测结果
+        self.face_detection_cache_curr = None  # 当前帧人脸检测结果
+        
+        # 2. SfM人脸关键点检测结果缓存
+        self.landmark_cache_prev = None  # 上一帧35点人脸关键点检测结果 (未畸变)
+        self.landmark_cache_curr = None  # 当前帧35点人脸关键点检测结果 (未畸变)
+        
     def RunGazeOnScreen(self, model, cap):
 
         if cap != None:
@@ -51,8 +60,13 @@ class SFM():
                 frame = None
 
             if frame is not None and frame_prev is not None:
+                # 预计算人脸特征点
                 p1 = model.get_FaceFeatures(frame_prev)
                 p2 = model.get_FaceFeatures(frame)
+                
+                # 更新缓存
+                self.update_caches(frame_prev_features=p1, frame_curr_features=p2)
+                
                 frame_prev = frame
 
                 E = estimateEssentialMatrix(p1, p2, self.camera_matrix, self.camera_matrix)
@@ -285,12 +299,61 @@ class SFM():
 
         plt.show()
 
-    def get_GazeToWorld(self, model, frame_prev, frame):
+    def get_GazeToWorld(self, model, frame_prev, frame, face_features_prev=None, face_features_curr=None):
+        """
+        获取从注视向量到世界坐标系的变换
+        
+        Args:
+            model: EyeModel实例
+            frame_prev: 上一帧图像
+            frame: 当前帧图像
+            face_features_prev: 可选，预计算的上一帧人脸特征点
+            face_features_curr: 可选，预计算的当前帧人脸特征点
+            
+        Returns:
+            W_T_G1: 从相机1(上一帧)到世界坐标系的变换矩阵
+            W_T_G2: 从相机2(当前帧)到世界坐标系的变换矩阵
+            W_P: 3D点云
+        """
         try:
-            p1 = model.get_FaceFeatures(frame_prev)[:2,:]
-            p1 = cv2.undistortPoints(p1, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
-            p2 = model.get_FaceFeatures(frame)[:2,:]
-            p2 = cv2.undistortPoints(p2, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
+            # 优先使用传入的预计算特征点，否则使用缓存或重新计算
+            # 关键点：确保只有原始特征点需要去畸变，缓存的landmark已经是去畸变后的
+            if face_features_prev is not None:
+                # 使用传入的预计算特征点（原始坐标）
+                p1_original = face_features_prev[:2,:]
+                # 对原始特征点进行去畸变
+                p1_undistorted = cv2.undistortPoints(p1_original, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
+                # 更新缓存
+                self.face_detection_cache_prev = face_features_prev
+                self.landmark_cache_prev = p1_undistorted
+            elif self.landmark_cache_prev is not None:
+                # 使用缓存的已去畸变特征点，不需要再次去畸变
+                p1_undistorted = self.landmark_cache_prev
+            else:
+                # 重新计算特征点（原始坐标）
+                p1_original = model.get_FaceFeatures(frame_prev)[:2,:]
+                # 对原始特征点进行去畸变
+                p1_undistorted = cv2.undistortPoints(p1_original, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
+                # 更新缓存
+                self.face_detection_cache_prev = model.get_FaceFeatures(frame_prev)  # 保存完整结果用于缓存
+                self.landmark_cache_prev = p1_undistorted
+            
+            # 当前帧处理同理
+            if face_features_curr is not None:
+                p2_original = face_features_curr[:2,:]
+                p2_undistorted = cv2.undistortPoints(p2_original, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
+                self.face_detection_cache_curr = face_features_curr
+                self.landmark_cache_curr = p2_undistorted
+            elif self.landmark_cache_curr is not None:
+                p2_undistorted = self.landmark_cache_curr
+            else:
+                p2_original = model.get_FaceFeatures(frame)[:2,:]
+                p2_undistorted = cv2.undistortPoints(p2_original, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
+                self.face_detection_cache_curr = model.get_FaceFeatures(frame)
+                self.landmark_cache_curr = p2_undistorted
+            
+            # 使用去畸变后的点进行后续计算
+            p1, p2 = p1_undistorted, p2_undistorted
 
             E = cv2.findEssentialMat(p1, p2, self.camera_matrix, method=cv2.RANSAC, prob=0.999, threshold=1.0)[0]
             _, G2_R_G1, G2_t_G1, _= cv2.recoverPose(E, p1, p2, self.camera_matrix)    # G1 cosy is world coordinate system
@@ -338,6 +401,65 @@ class SFM():
         t = (VectorNormal2Plane.T @ transVec) / (VectorNormal2Plane.T @ vector)
         Vector2Plane = np.vstack((t*vector, 1))
         return Vector2Plane
+        
+    def update_caches(self, frame_prev_features=None, frame_curr_features=None):
+        """
+        更新缓存的人脸检测和关键点检测结果
+        
+        Args:
+            frame_prev_features: 上一帧的人脸特征点
+            frame_curr_features: 当前帧的人脸特征点
+        """
+        # 更新人脸检测结果缓存
+        if frame_prev_features is not None:
+            self.face_detection_cache_prev = frame_prev_features
+        if frame_curr_features is not None:
+            self.face_detection_cache_curr = frame_curr_features
+            
+        # 关键点缓存会在get_GazeToWorld内部自动更新
+        
+    def clear_caches(self):
+        """
+        清除所有缓存数据
+        """
+        self.face_detection_cache_prev = None
+        self.face_detection_cache_curr = None
+        self.landmark_cache_prev = None
+        self.landmark_cache_curr = None
+        
+    def get_cached_face_features(self, frame_type='prev'):
+        """
+        获取缓存的人脸特征点
+        
+        Args:
+            frame_type: 'prev' 或 'curr'
+            
+        Returns:
+            缓存的人脸特征点，如果不存在则返回None
+        """
+        if frame_type == 'prev':
+            return self.face_detection_cache_prev
+        elif frame_type == 'curr':
+            return self.face_detection_cache_curr
+        else:
+            return None
+        
+    def get_cached_landmarks(self, frame_type='prev'):
+        """
+        获取缓存的去畸变后的关键点
+        
+        Args:
+            frame_type: 'prev' 或 'curr'
+            
+        Returns:
+            缓存的去畸变关键点，如果不存在则返回None
+        """
+        if frame_type == 'prev':
+            return self.landmark_cache_prev
+        elif frame_type == 'curr':
+            return self.landmark_cache_curr
+        else:
+            return None
 
 if __name__ == '__main__':
     dir = "C:\\temp\\WebCamGazeEstimation\\"

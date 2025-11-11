@@ -365,6 +365,10 @@ class PygameGazeSystem:
         # 用于SfM的前一帧
         frame_prev = None
         
+        # 缓存变量，避免重复计算
+        cached_face_features_prev = None
+        cached_face_features_curr = None
+        
         while True:
             ret, frame = self.cap.read()
             if not ret:
@@ -381,15 +385,43 @@ class PygameGazeSystem:
                 try:
                     if frame_prev is not None:
                         try:
-                            # 尝试使用SfM方法
+                            # 优化：只在必要时重新计算人脸特征点
+                            # 对于当前帧，我们总是需要计算新的特征点
+                            face_features_curr = self.model.get_FaceFeatures(frame)
+                            
+                            # 对于前一帧，我们可以使用上一次计算的当前帧特征点
+                            # 这样避免了每帧都重新计算两个帧的特征点
+                            if cached_face_features_curr is not None:
+                                face_features_prev = cached_face_features_curr
+                            else:
+                                face_features_prev = self.model.get_FaceFeatures(frame_prev)
+                            
+                            # 更新缓存：当前帧的特征点将成为下一帧的前一帧特征点
+                            cached_face_features_prev = face_features_prev
+                            cached_face_features_curr = face_features_curr
+                            
+                            # 尝试使用SfM方法，并传入预计算的特征点
                             # 获取世界坐标系中的视线方向
-                            WTransG1, WTransG2, W_P = self.homtrans.sfm.get_GazeToWorld(self.model, frame_prev, frame)
+                            WTransG1, WTransG2, W_P = self.homtrans.sfm.get_GazeToWorld(
+                                self.model, frame_prev, frame, 
+                                face_features_prev=face_features_prev, 
+                                face_features_curr=face_features_curr
+                            )
+                            
                             # 使用SfM方法将3D视线向量转换为2D屏幕坐标
                             FSgaze, Sgaze, Sgaze2 = self.homtrans._getGazeOnScreen_sfm(gaze, WTransG1)
+                            
+                            # 更新SfM模块的缓存
+                            self.homtrans.sfm.update_caches(
+                                frame_prev_features=face_features_prev,
+                                frame_curr_features=face_features_curr
+                            )
                         except Exception as sfm_error:
                             # SfM计算失败，回退到普通方法
                             print(f"SfM计算失败，回退到普通方法: {sfm_error}")
                             FSgaze, Sgaze, Sgaze2 = self.homtrans._getGazeOnScreen(gaze)
+                            # 清除缓存以避免错误数据影响下一次计算
+                            self.homtrans.sfm.clear_caches()
                     else:
                         # 初始帧使用普通方法
                         FSgaze, Sgaze, Sgaze2 = self.homtrans._getGazeOnScreen(gaze)
@@ -428,7 +460,10 @@ class PygameGazeSystem:
             if event == 'quit':
                 break
             
-            self.ui.clock.tick(30)
+            # 提高帧率限制，以展示缓存机制带来的性能提升
+            # 移除固定帧率限制，让程序以最大可能速度运行
+            # self.ui.clock.tick(30)
+            pass
     
     def run(self):
         """运行主程序"""
