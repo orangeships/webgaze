@@ -6,6 +6,7 @@ import time
 import numpy as np
 from gaze_tracking.homtransform import HomTransform
 from gaze_tracking.model import EyeModel
+from gaze_tracking.gaze_smoothing import KalmanFilter
 
 # Pygame初始化
 pygame.init()
@@ -150,7 +151,7 @@ class PygameUI:
         
         pygame.display.flip()
     
-    def show_gaze_tracking_screen(self, frame, gaze_point=None):
+    def show_gaze_tracking_screen(self, frame, gaze_point=None, kalman_enabled=True):
         """显示视线追踪界面"""
         # 显示简单的追踪界面，不显示摄像头画面
         self.screen.fill(WHITE)
@@ -169,12 +170,30 @@ class PygameUI:
         if gaze_point:
             pygame.draw.circle(self.screen, RED, gaze_point, 15)
         
+        # 卡尔曼滤波状态显示和切换按钮
+        kalman_status = "启用" if kalman_enabled else "禁用"
+        kalman_color = GREEN if kalman_enabled else RED
+        kalman_text = self.font_small.render(f"卡尔曼滤波: {kalman_status}", True, kalman_color)
+        kalman_rect = kalman_text.get_rect(center=(self.width // 2, self.height // 2 + 80))
+        self.screen.blit(kalman_text, kalman_rect)
+        
+        # 切换按钮
+        toggle_button_rect = self.draw_button(
+            "切换滤波", 
+            self.width // 2 - 100, 
+            self.height // 2 + 120, 
+            200, 50, 
+            kalman_color
+        )
+        
         # 退出说明
         exit_text = self.font_small.render("按ESC键退出", True, GRAY)
         exit_rect = exit_text.get_rect(center=(self.width // 2, 3 * self.height // 4))
         self.screen.blit(exit_text, exit_rect)
         
         pygame.display.flip()
+        
+        return toggle_button_rect
     
     def handle_events(self):
         """处理事件"""
@@ -198,6 +217,10 @@ class PygameGazeSystem:
         self.homtrans = None
         self.cap = None
         self.calibration_data = None
+        # 初始化卡尔曼滤波器用于平滑视线点
+        # 参数调整: process_noise越小，滤波越平滑；measurement_noise越小，越信任测量值
+        self.kalman_filter = KalmanFilter(process_noise=0.01, measurement_noise=2.0, error_estimate=1.0)
+        self.kalman_enabled = True  # 卡尔曼滤波开关，默认为启用
         
     def initialize(self):
         """初始化系统"""
@@ -365,17 +388,20 @@ class PygameGazeSystem:
         # 用于SfM的前一帧
         frame_prev = None
         
-        # 缓存变量，避免重复计算
-        cached_face_features_prev = None
-        cached_face_features_curr = None
+        # 移除本地缓存变量，直接使用SFM模块内部的缓存机制
+        # cached_face_features_prev = None
+        # cached_face_features_curr = None
         
         while True:
             ret, frame = self.cap.read()
             if not ret:
                 break
             
-            # 获取视线信息
-            eye_info = self.model.get_gaze(frame=frame, imshow=False)
+            # 优化：每帧只检测一次人脸
+            face_boxes = self.model.face_detection.predict(frame)
+            
+            # 使用检测到的人脸框调用get_gaze方法
+            eye_info = self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
             
             if eye_info is not None:
                 # 获取3D视线向量
@@ -385,20 +411,17 @@ class PygameGazeSystem:
                 try:
                     if frame_prev is not None:
                         try:
-                            # 优化：只在必要时重新计算人脸特征点
+                                            # 优化：只在必要时重新计算人脸特征点
                             # 对于当前帧，我们总是需要计算新的特征点
-                            face_features_curr = self.model.get_FaceFeatures(frame)
+                            face_features_curr = self.model.get_FaceFeatures(frame, face_boxes=face_boxes)
                             
                             # 对于前一帧，我们可以使用上一次计算的当前帧特征点
                             # 这样避免了每帧都重新计算两个帧的特征点
-                            if cached_face_features_curr is not None:
-                                face_features_prev = cached_face_features_curr
+                            cached_prev_features = self.homtrans.sfm.get_cached_face_features('curr')
+                            if cached_prev_features is not None:
+                                face_features_prev = cached_prev_features
                             else:
-                                face_features_prev = self.model.get_FaceFeatures(frame_prev)
-                            
-                            # 更新缓存：当前帧的特征点将成为下一帧的前一帧特征点
-                            cached_face_features_prev = face_features_prev
-                            cached_face_features_curr = face_features_curr
+                                face_features_prev = self.model.get_FaceFeatures(frame_prev, face_boxes=face_boxes)
                             
                             # 尝试使用SfM方法，并传入预计算的特征点
                             # 获取世界坐标系中的视线方向
@@ -433,7 +456,13 @@ class PygameGazeSystem:
                     # 确保坐标在屏幕范围内
                     gaze_x = max(0, min(screen_pos_px[0], self.ui.width))
                     gaze_y = max(0, min(screen_pos_px[1], self.ui.height))
-                    gaze_point = (int(gaze_x), int(gaze_y))
+                    
+                    # 应用卡尔曼滤波平滑视线点
+                    if self.kalman_enabled:
+                        smoothed_gaze = self.kalman_filter.update([gaze_x, gaze_y])
+                        gaze_point = (int(smoothed_gaze[0]), int(smoothed_gaze[1]))
+                    else:
+                        gaze_point = (int(gaze_x), int(gaze_y))
                 except Exception as e:
                     print(f"视线映射出错: {e}")
                     gaze_point = None
@@ -454,11 +483,17 @@ class PygameGazeSystem:
                 fps_start_time = current_time
             
             # 显示结果
-            self.ui.show_gaze_tracking_screen(frame, gaze_point)
+            toggle_button_rect = self.ui.show_gaze_tracking_screen(frame, gaze_point, self.kalman_enabled)
             
             event = self.ui.handle_events()
             if event == 'quit':
                 break
+            elif event == 'click':
+                mouse_pos = pygame.mouse.get_pos()
+                if toggle_button_rect.collidepoint(mouse_pos):
+                    # 切换卡尔曼滤波状态
+                    self.kalman_enabled = not self.kalman_enabled
+                    print(f"卡尔曼滤波已{'启用' if self.kalman_enabled else '禁用'}")
             
             # 提高帧率限制，以展示缓存机制带来的性能提升
             # 移除固定帧率限制，让程序以最大可能速度运行

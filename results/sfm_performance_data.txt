@@ -2,28 +2,28 @@ SfM Module Performance Analysis Results
 ==================================================
 
 Average Execution Time (ms):
-Face Detection: 31.943 ms
-Landmark Detection: 8.234 ms
-Total Face Features: 40.177 ms
-Undistortion: 0.049 ms
-Essential Matrix: 1.232 ms
-Pose Recovery: 0.325 ms
-Triangulation: 0.197 ms
-Plane Fitting: 0.127 ms
-Rotation Matrix: 0.101 ms
-Total SfM Time: 2.036 ms
+Face Detection: 36.695 ms
+Landmark Detection: 9.034 ms
+Total Face Features: 45.729 ms
+Undistortion: 0.202 ms
+Essential Matrix: 1.831 ms
+Pose Recovery: 0.495 ms
+Triangulation: 0.330 ms
+Plane Fitting: 0.407 ms
+Rotation Matrix: 0.102 ms
+Total SfM Time: 3.374 ms
 
-Performance Comparison: Face detection is 23.708 ms faster than landmark detection
+Performance Comparison: Face detection is 27.661 ms faster than landmark detection
 
 Time Percentage (%):
-Face Detection: 75.7%
-Landmark Detection: 19.5%
-Essential Matrix: 2.9%
-Pose Recovery: 0.8%
-Triangulation: 0.5%
-Plane Fitting: 0.3%
+Face Detection: 74.7%
+Landmark Detection: 18.4%
+Essential Matrix: 3.7%
+Pose Recovery: 1.0%
+Plane Fitting: 0.8%
+Triangulation: 0.7%
+Undistortion: 0.4%
 Rotation Matrix: 0.2%
-Undistortion: 0.1%
 
 ==================================================
 Successful Measurements: 32 frames

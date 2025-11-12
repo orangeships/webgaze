@@ -497,17 +497,19 @@ class EyeModel:
             print(f"Error in Optical Flow: {e}")
             return np.array([0,0])
 
-    def get_gaze(self, frame, imshow=False):
+    def get_gaze(self, frame, imshow=False, face_boxes=None):
         """
         生成并返回当前帧的注视信息
-        1. 检测人脸
+        1. 检测人脸（如果未提供）
         2. 提取双眼图像与中心坐标
         3. 估算头部姿态
         4. 估算注视向量（经中值滤波平滑）
         5. 判断睁眼/闭眼状态
         6. 组装并返回结构化结果
         """
-        face_boxes = self.face_detection.predict(frame)
+        # 如果没有提供人脸框，则执行人脸检测
+        if face_boxes is None:
+            face_boxes = self.face_detection.predict(frame)
         open_close = {'close': 0, 'open': 1}
         eye_info = None
 
@@ -542,9 +544,10 @@ class EyeModel:
             )
 
             # 组装结果字典
+            # 返回结果字典，保持与原始代码的数据结构完全一致
             eye_info = {
                 'gaze': gaze_vector,
-                'EyeRLCenterPos': np.array(eye_centers).reshape(-1),
+                'EyeRLCenterPos': np.array(eye_centers).reshape(-1),  # 恢复原始格式
                 'HeadPosAnglesYPR': head_pose_angles,
                 'HeadPosInFrame': head_box,
                 'right_eye_box': right_eye_box,
@@ -577,13 +580,15 @@ class EyeModel:
 
         return eye_info
 
-    def get_FaceFeatures(self, frame, imshow=False):
-        face_boxes = self.face_detection.predict(frame)
+    def get_FaceFeatures(self, frame, imshow=False, face_boxes=None):
+        # 如果没有提供人脸框，则执行人脸检测
+        if face_boxes is None:
+            face_boxes = self.face_detection.predict(frame)
         if len(face_boxes) < 1:
             print("No face detected for get_FaceFeatures!")
             cv2.imwrite(os.path.join(self.dir, "results", "no_face.jpg"), frame)
-            # 返回一个合适的2维数组，而不是1维数组，以避免索引错误
-            return np.zeros((3, 36))
+            # 返回一个合适的2维数组，包含35个特征点
+            return np.zeros((3, 35))
 
         else:
             if len(face_boxes) > 1:
@@ -591,9 +596,11 @@ class EyeModel:
             face_box = face_boxes[0]
             face = self.get_crop_image(frame, face_box)
             landmarks = self.facial_landmark_35.predict(face)   # shape 35,2
-        
+            
+            # 确保返回35个特征点，与sfm_module.py中期望的一致
             xmin, ymin, xmax, ymax = face_box
-            points = np.zeros_like(landmarks)
+            points = np.zeros_like(landmarks)  # 保持为35个特征点
+            
             for idx, pos in enumerate(landmarks):
                 x = pos[0] + xmin
                 y = pos[1] + ymin

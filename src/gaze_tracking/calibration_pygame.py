@@ -53,16 +53,17 @@ class PygameCalibrationUI:
             self.font_small = pygame.font.Font(None, 24)
     
     def _build_grid_points(self):
-        """构建4点校准网格"""
+        """构建5点校准网格"""
         margin_x = int(self.width * self.margin_ratio)
         margin_y = int(self.height * self.margin_ratio)
         
-        # 4点校准：四个角
+        # 5点校准：四个角 + 屏幕中心
         points = [
             [margin_x, margin_y],  # 左上角
             [self.width - margin_x, margin_y],  # 右上角
             [margin_x, self.height - margin_y],  # 左下角
-            [self.width - margin_x, self.height - margin_y]  # 右下角
+            [self.width - margin_x, self.height - margin_y],  # 右下角
+            [self.width // 2, self.height // 2]  # 屏幕中心
         ]
         
         return points
@@ -231,12 +232,13 @@ class PygameCalibrationTargets:
         margin_x = int(self.width * self.margin_ratio)
         margin_y = int(self.height * self.margin_ratio)
         
-        # 4点校准：四个角
+        # 5点校准：四个角 + 屏幕中心
         points = [
             [margin_x, margin_y],  # 左上角
             [self.width - margin_x, margin_y],  # 右上角
             [margin_x, self.height - margin_y],  # 左下角
-            [self.width - margin_x, self.height - margin_y]  # 右下角
+            [self.width - margin_x, self.height - margin_y],  # 右下角
+            [self.width // 2, self.height // 2]  # 屏幕中心
         ]
         
         return points
