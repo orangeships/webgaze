@@ -351,17 +351,19 @@ class HomTransform:
                 # 增加有效帧计数
                 valid_frames += 1
                 
-                # 处理eye_info数据
-                arr = np.array([])
-                if eye_info is not None:
-                    for i in pd.Series(eye_info).values:
-                        arr = np.hstack((arr, i))
-                else:
-                    arr = np.zeros(19)
-                
-                timestamp = time.time_ns() / 1000000000
-                SetPos_mm = self._pixel2mm(SetPos)
-                self.df = pd.concat([self.df, pd.DataFrame([np.hstack((timestamp, idx, arr, SetPos_mm, 0, WTransG1.flatten()))])])
+                # 只有在can_record为True时才记录校准数据（确保用户有足够时间注视目标）
+                if hasattr(calib_targets, 'can_record') and calib_targets.can_record:
+                    # 处理eye_info数据
+                    arr = np.array([])
+                    if eye_info is not None:
+                        for i in pd.Series(eye_info).values:
+                            arr = np.hstack((arr, i))
+                    else:
+                        arr = np.zeros(19)
+                    
+                    timestamp = time.time_ns() / 1000000000
+                    SetPos_mm = self._pixel2mm(SetPos)
+                    self.df = pd.concat([self.df, pd.DataFrame([np.hstack((timestamp, idx, arr, SetPos_mm, 0, WTransG1.flatten()))])])
                 
             except Exception as e:
                 pass
@@ -525,198 +527,52 @@ class HomTransform:
             return False
 
     def _getGazeOnScreen(self, gaze):
-        """
-        将注视向量从相机坐标系转换到屏幕坐标系（无 SfM 情况）
-        
-        参数:
-            gaze: 3D 注视向量（相机坐标系，单位向量）
-        
-        返回:
-            FSgaze: 融合后的屏幕注视点 3D 坐标 (3×1)
-            Sgaze:  整体回归得到的屏幕注视点 3D 坐标 (3×1)
-            Sgaze2: 最近校准点对应的屏幕注视点 3D 坐标 (3×1)
-        """
-        
-        # 1. 计算 gaze 向量在屏幕坐标系下的比例因子，使 gaze 与屏幕平面相交
         scaleGaze = self._getScale(gaze, self.STransG)
-        # 2. 利用整体标定得到的 STransG 将 gaze 映射到屏幕平面，得到整体回归的屏幕注视点
         Sgaze = (self.STransG @ np.vstack((scaleGaze*gaze[:,None], 1)))[:3]
 
-        # 3. 屏幕坐标系下的旋转矩阵：X、Y 反向，Z 保持（与相机坐标系相反）
         SRotG = np.array([[-1,0,0],[0,-1,0],[0,0,1]])
-        dist = np.inf
-        
-        # 存储所有校准点的映射结果和距离
-        all_Sgaze = []
-        all_distances = []
-        
-        # 4. 遍历所有校准点，计算对应的 STransG_i，将 gaze 映射到屏幕
+        dist = np.inf            
+        """ Compute STransG for all calibration points and choose the one with the smallest distance to the overall gaze point on screen """
         for i in range(len(self.StG)):
-            # 构造该校准点的变换矩阵：旋转相同，平移为 StG[i]
             STransG_ = np.vstack((np.hstack((SRotG,self.StG[i].reshape(3,1))), np.array([0,0,0,1])))
             scaleGaze = self._getScale(gaze, STransG_)
             Sgaze_ = (STransG_ @ np.vstack((scaleGaze*gaze[:,None],1)))[0:3]
-            
-            # 计算与全局映射点的距离
-            current_dist = np.linalg.norm(Sgaze - Sgaze_)
-            
-            # 记录距离最小的映射点
-            if current_dist < dist:
-                dist = current_dist
-                Sgaze2 = Sgaze_
-            
-            # 保存所有校准点的映射结果和距离
-            all_Sgaze.append(Sgaze_)
-            all_distances.append(current_dist)
-        
-        # 5. 实现基于距离的加权平均替代中位数融合
-        # 添加全局映射点到列表中
-        all_Sgaze.append(Sgaze)
-        all_distances.append(0.0)  # 全局映射点的距离设为0
-        
-        # 计算权重（使用距离的倒数，添加小常数避免除零）
-        distances = np.array(all_distances)
-        weights = 1.0 / (distances + 1e-10)  # 添加小常数避免除零
-        weights = weights / np.sum(weights)  # 归一化权重
-        
-        # 执行加权平均
-        FSgaze = np.zeros((3, 1))
-        for i in range(len(all_Sgaze)):
-            FSgaze += weights[i] * all_Sgaze[i]
-        
-        # 6. 应用双线性插值进一步优化结果
-        if hasattr(self, 'SetValues') and len(self.SetValues) >= 4:
-            # 获取最近的四个校准点
-            nearest_points, nearest_indices = self._get_nearest_calibration_points(FSgaze[:2].flatten(), n=4)
-            
-            if nearest_points and len(nearest_points) == 4:
-                # 获取这四个校准点对应的映射结果
-                nearest_values = []
-                for idx in nearest_indices:
-                    # 构造当前校准点的变换矩阵
-                    STransG_ = np.vstack((np.hstack((SRotG, self.StG[idx].reshape(3, 1))),
-                                          np.array([0, 0, 0, 1])))
-                    # 计算映射点
-                    scaleGaze = self._getScale(gaze, STransG_)
-                    Sgaze_ = (STransG_ @ np.vstack((scaleGaze * gaze[:, None], 1)))[:3]
-                    nearest_values.append(Sgaze_)
-                
-                # 执行双线性插值
-                interpolated_gaze = self._bilinear_interpolation(FSgaze[:2].flatten(), nearest_points, nearest_values)
-                
-                # 如果插值成功，使用插值结果
-                if interpolated_gaze is not None:
-                    # 结合距离加权结果和双线性插值结果，给予适当权重
-                    FSgaze = 0.7 * FSgaze + 0.3 * interpolated_gaze
-        
+            if np.linalg.norm(Sgaze - Sgaze_) < dist:
+                dist = np.linalg.norm(Sgaze - Sgaze_)
+                Sgaze2 = Sgaze_                                 
+
+        FSgaze = np.median(np.hstack((Sgaze, Sgaze2)), axis=1).reshape(3,1)
+
+        """
+        FSgaze = fused gaze vector, overall and for each calibration point
+        Sgaze = overall gaze vector, determined over regression in screen coordinate system
+        Sgaze2 = gaze vector from calibration point
+        """
         return FSgaze, Sgaze, Sgaze2
 
     def _getGazeOnScreen_sfm(self, gaze, WTransG):
-        """
-        使用 SfM（Structure-from-Motion）得到的头部运动信息，将 3D 注视向量 gaze 映射到屏幕坐标系。
-        
-        主要流程：
-        1. 根据之前标定得到的 scaleWtG，对世界坐标系下的平移向量进行缩放，使深度尺度与屏幕坐标系一致。
-        2. 计算“屏幕→世界”的变换矩阵 STransW 与“世界→头部”的变换矩阵 WTransG 的乘积，得到
-           “屏幕→头部”的粗略变换 STransG。
-        3. 利用 _getScale 计算 gaze 向量需要缩放的比例 scaleGaze，使其射线与屏幕平面（Z=0）相交，
-           得到初步的屏幕注视点 Sgaze。
-        4. 遍历所有校准阶段保存的局部“屏幕→世界”平移向量 StW[i]，为每个校准点构造对应的
-           辅助变换矩阵 STransG_，重复步骤 3 计算对应的屏幕注视点 Sgaze_。
-        5. 在所有 Sgaze_ 中，选取与“全局”Sgaze 最接近（欧氏距离最小）的一个作为 Sgaze2，
-           用于补偿头部运动带来的偏差。
-        6. 使用基于距离的加权平均替代中位数，得到最终融合后的屏幕注视点 FSgaze，兼顾全局回归与
-           局部校准点的修正，提高鲁棒性。
-        7. 结合双线性插值优化最终的注视点估计，进一步减少"吸引效应"。
-        
-        返回:
-            FSgaze: (3,1) 融合后的屏幕注视点（单位：mm）
-            Sgaze:  (3,1) 基于全局变换矩阵映射的屏幕注视点
-            Sgaze2: (3,1) 基于最近校准点局部变换映射的屏幕注视点
-        """
-        
-        # 1. 用标定得到的 scaleWtG 对世界坐标系下的平移向量进行缩放，保证深度尺度一致
-        WTransG[:3, 3] = self.scaleWtG * WTransG[:3, 3]
-        
-        # 2. 计算屏幕→头部的粗略变换：STransG = STransW @ WTransG
+        WTransG[:3,3] = self.scaleWtG*WTransG[:3,3]
         STransG = self.STransW @ WTransG
-        
-        # 3. 计算 gaze 向量与屏幕平面相交所需的缩放比例，并映射到屏幕坐标系
         scaleGaze = self._getScale(gaze, STransG)
-        Sgaze = (STransG @ np.vstack((scaleGaze * gaze[:, None], 1)))[:3]
-        
-        # 4. 初始化变量：SRotW 为屏幕坐标系与世界坐标系之间的旋转关系
-        SRotW = np.array([[-1, 0, 0],
-                          [ 0, 1, 0],
-                          [ 0, 0,-1]])
-        dist = np.inf  # 记录最小距离
-        
-        # 存储所有校准点的映射结果和距离
-        all_Sgaze = []
-        all_distances = []
-        
-        # 遍历所有校准阶段保存的局部平移向量 StW[i]，构造辅助变换矩阵，计算对应的屏幕注视点
+        Sgaze = (STransG @ np.vstack((scaleGaze*gaze[:,None], 1)))[:3]
+
+        SRotW = np.array([[-1,0,0],[0,1,0],[0,0,-1]])
+        dist = np.inf            
+        """ Compute STransG for all calibration points and choose the one with the smallest distance to the overall gaze point on screen """
         for i in range(len(self.StW)):
-            # 构造当前校准点的“屏幕→头部”变换矩阵
-            STransG_ = np.vstack((np.hstack((SRotW, self.StW[i].reshape(3, 1))),
-                                  np.array([0, 0, 0, 1]))) @ WTransG
-            # 计算 gaze 在该变换下的映射点 Sgaze_
+            STransG_ = np.vstack((np.hstack((SRotW, self.StW[i].reshape(3,1))), np.array([0,0,0,1]))) @ WTransG
             scaleGaze = self._getScale(gaze, STransG_)
-            Sgaze_ = (STransG_ @ np.vstack((scaleGaze * gaze[:, None], 1)))[0:3]
-            
-            # 计算与全局映射点的距离
-            current_dist = np.linalg.norm(Sgaze - Sgaze_)
-            
-            # 选取与全局 Sgaze 最接近的局部映射点作为 Sgaze2
-            if current_dist < dist:
-                dist = current_dist
+            Sgaze_ = (STransG_ @ np.vstack((scaleGaze*gaze[:,None],1)))[0:3]
+            if np.linalg.norm(Sgaze - Sgaze_) < dist:
+                dist = np.linalg.norm(Sgaze - Sgaze_)
                 Sgaze2 = Sgaze_
-            
-            # 保存所有校准点的映射结果和距离
-            all_Sgaze.append(Sgaze_)
-            all_distances.append(current_dist)
-        
-        # 实现基于距离的加权平均替代中位数融合
-        # 添加全局映射点到列表中
-        all_Sgaze.append(Sgaze)
-        all_distances.append(0.0)  # 全局映射点的距离设为0
-        
-        # 计算权重（使用距离的倒数，添加小常数避免除零）
-        distances = np.array(all_distances)
-        weights = 1.0 / (distances + 1e-10)  # 添加小常数避免除零
-        weights = weights / np.sum(weights)  # 归一化权重
-        
-        # 执行加权平均
-        FSgaze = np.zeros((3, 1))
-        for i in range(len(all_Sgaze)):
-            FSgaze += weights[i] * all_Sgaze[i]
-        
-        # 应用双线性插值进一步优化结果
-        if hasattr(self, 'SetValues') and len(self.SetValues) >= 4:
-            # 获取最近的四个校准点
-            nearest_points, nearest_indices = self._get_nearest_calibration_points(FSgaze[:2].flatten(), n=4)
-            
-            if nearest_points and len(nearest_points) == 4:
-                # 获取这四个校准点对应的映射结果
-                nearest_values = []
-                for idx in nearest_indices:
-                    # 构造当前校准点的变换矩阵
-                    STransG_ = np.vstack((np.hstack((SRotW, self.StW[idx].reshape(3, 1))),
-                                          np.array([0, 0, 0, 1]))) @ WTransG
-                    # 计算映射点
-                    scaleGaze = self._getScale(gaze, STransG_)
-                    Sgaze_ = (STransG_ @ np.vstack((scaleGaze * gaze[:, None], 1)))[0:3]
-                    nearest_values.append(Sgaze_)
-                
-                # 执行双线性插值
-                interpolated_gaze = self._bilinear_interpolation(FSgaze[:2].flatten(), nearest_points, nearest_values)
-                
-                # 如果插值成功，使用插值结果
-                if interpolated_gaze is not None:
-                    # 结合距离加权结果和双线性插值结果，给予适当权重
-                    FSgaze = 0.7 * FSgaze + 0.3 * interpolated_gaze
-        
-        # 返回融合结果以及两个中间结果，便于后续分析或可视化
+
+        FSgaze = np.median(np.hstack((Sgaze, Sgaze2)), axis=1).reshape(3,1)
+        """
+        FSgaze = fused gaze vector, overall and for each calibration point
+        Sgaze = overall gaze vector, determined over regression in screen coordinate system with head movement
+        Sgaze2 = gaze vector from calibration point with head movements
+        """
         return FSgaze, Sgaze, Sgaze2
       
 
@@ -866,109 +722,7 @@ class HomTransform:
 
         return STransG, GTransS
 
-    def _bilinear_interpolation(self, point, four_points, four_values):
-        """
-        双线性插值函数
-        
-        参数:
-            point: 要插值的点坐标 (x, y)
-            four_points: 四个角点坐标列表 [(x1,y1), (x2,y2), (x3,y3), (x4,y4)]
-                        要求是一个矩形的四个角点（顺时针或逆时针排列）
-            four_values: 四个角点对应的属性值列表 [v1, v2, v3, v4]
-        
-        返回:
-            插值后的属性值
-        """
-        # 将四个点按顺序排序，确保是一个矩形
-        # 找到最小和最大的 x 和 y
-        xs = [p[0] for p in four_points]
-        ys = [p[1] for p in four_points]
-        x_min, x_max = min(xs), max(xs)
-        y_min, y_max = min(ys), max(ys)
-        
-        # 确定四个角点的位置
-        p1 = (x_min, y_min)  # 左下
-        p2 = (x_max, y_min)  # 右下
-        p3 = (x_max, y_max)  # 右上
-        p4 = (x_min, y_max)  # 左上
-        
-        # 找到对应的索引
-        def find_index(p):
-            for i, (px, py) in enumerate(four_points):
-                if abs(px - p[0]) < 1e-6 and abs(py - p[1]) < 1e-6:
-                    return i
-            return -1
-        
-        idx1 = find_index(p1)
-        idx2 = find_index(p2)
-        idx3 = find_index(p3)
-        idx4 = find_index(p4)
-        
-        # 如果找不到对应的点，返回None
-        if -1 in [idx1, idx2, idx3, idx4]:
-            return None
-        
-        # 获取四个角点的值
-        v1 = four_values[idx1]
-        v2 = four_values[idx2]
-        v3 = four_values[idx3]
-        v4 = four_values[idx4]
-        
-        # 双线性插值
-        x, y = point
-        
-        # 归一化坐标到 [0, 1] 范围
-        if x_max - x_min > 0 and y_max - y_min > 0:
-            u = (x - x_min) / (x_max - x_min)
-            v = (y - y_min) / (y_max - y_min)
-        else:
-            # 如果四个点几乎重合，直接返回平均值
-            return (v1 + v2 + v3 + v4) / 4
-        
-        # 双线性插值公式
-        if isinstance(v1, (int, float)):
-            # 标量值插值
-            result = (1-u)*(1-v)*v1 + u*(1-v)*v2 + u*v*v3 + (1-u)*v*v4
-        else:
-            # 向量值插值
-            result = (1-u)*(1-v)*v1 + u*(1-v)*v2 + u*v*v3 + (1-u)*v*v4
-        
-        return result
-        
-    def _get_nearest_calibration_points(self, point, n=4):
-        """
-        获取最接近给定点的n个校准点
-        
-        参数:
-            point: 输入点 (x, y)
-            n: 返回的校准点数量
-        
-        返回:
-            最近的n个校准点的坐标和对应的索引
-        """
-        if not hasattr(self, 'SetValues') or len(self.SetValues) < n:
-            return None, None
-        
-        # 计算到每个校准点的距离
-        distances = []
-        for i, calib_point in enumerate(self.SetValues):
-            if isinstance(calib_point, np.ndarray):
-                dist = np.linalg.norm(calib_point[:2] - np.array(point[:2]))
-            else:
-                dist = np.linalg.norm(np.array(calib_point[:2]) - np.array(point[:2]))
-            distances.append((dist, i, calib_point))
-        
-        # 按距离排序
-        distances.sort(key=lambda x: x[0])
-        
-        # 返回最近的n个点
-        nearest_points = []
-        nearest_indices = []
-        for i in range(min(n, len(distances))):
-            nearest_points.append(distances[i][2][:2])  # 只取x, y坐标
-            nearest_indices.append(distances[i][1])
-        
-        return nearest_points, nearest_indices
+
     
     def _getScale(self, gaze, STransG):
         Gz = np.array([[0],[0],[1]])
