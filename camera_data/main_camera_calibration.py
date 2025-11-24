@@ -31,7 +31,7 @@ objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
 objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2) * square_size
 
 # Start the camera
-cap=cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap=cv2.VideoCapture(1, cv2.CAP_DSHOW)
 # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 960)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
