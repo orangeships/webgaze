@@ -44,9 +44,9 @@ class KalmanFilter:
         # 是否已初始化
         self.initialized = False
         
-        # 自适应参数阈值
-        self.ACCEL_THRESHOLD = 1000.0  # 提高加速度阈值，避免正常注视误识别为眼跳
-        self.VELOCITY_THRESHOLD = 10.0   # 提高速度阈值，减少误识别
+        # 自适应参数阈值 - 优化以减少抖动
+        self.ACCEL_THRESHOLD = 800.0  # 降低加速度阈值，更早识别眼跳
+        self.VELOCITY_THRESHOLD = 8.0   # 降低速度阈值，更好区分注视和眼跳
         self.previous_velocity = 0.0
     
     def predict(self):
@@ -70,18 +70,18 @@ class KalmanFilter:
         
         if acceleration > self.ACCEL_THRESHOLD:  # 可能开始眼跳
             # 眼跳期间：信任测量，不信任模型预测
-            Q = np.diag([50, 50, 100, 100])  # 大过程噪声
-            R = np.diag([5, 5])              # 小测量噪声
+            Q = np.diag([30, 30, 60, 60])  # 减小过程噪声，避免过度响应
+            R = np.diag([3, 3])              # 小测量噪声
             
         elif velocity < self.VELOCITY_THRESHOLD:  # 注视状态
-            # 注视期间：极强平滑
-            Q = np.diag([0.1, 0.1, 0.01, 0.01])    # 极小过程噪声  
-            R = np.diag([50, 50])                  # 极大测量噪声
+            # 注视期间：极强平滑 - 优化参数减少抖动
+            Q = np.diag([0.05, 0.05, 0.005, 0.005])    # 更小过程噪声，更强平滑  
+            R = np.diag([80, 80])                      # 更大测量噪声，更不信任测量
             
         else:  # 平滑追随
-            # 平衡模式
-            Q = np.diag([10, 10, 1, 1])
-            R = np.diag([10, 10])
+            # 平衡模式 - 优化参数
+            Q = np.diag([5, 5, 0.5, 0.5])    # 减小过程噪声
+            R = np.diag([15, 15])            # 增大测量噪声
             
         return Q, R
 
