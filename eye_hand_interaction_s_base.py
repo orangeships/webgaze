@@ -606,9 +606,9 @@ class EyeHandInteractionSystem:
             screen_width = screen_geometry.width()
             screen_height = screen_geometry.height()
         
-        # 计算屏幕对角线的1/6作为快速移动距离阈值（根据新要求修改）
+        # 计算屏幕对角线的1/10作为快速移动距离阈值（根据新要求修改）
         screen_diagonal = np.sqrt(screen_width**2 + screen_height**2)
-        self.rapid_gaze_distance_threshold = screen_diagonal / 6
+        self.rapid_gaze_distance_threshold = screen_diagonal / 10
         
         # 系统初始化完成（简化输出）
         

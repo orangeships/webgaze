@@ -604,9 +604,9 @@ class EyeHandInteractionSystem:
             screen_width = screen_geometry.width()
             screen_height = screen_geometry.height()
         
-        # 计算屏幕对角线的1/8作为鼠标移动触发阈值
+        # 计算屏幕对角线的1/4作为鼠标移动触发阈值
         screen_diagonal = np.sqrt(screen_width**2 + screen_height**2)
-        self.auto_mouse_move_threshold = screen_diagonal / 8
+        self.auto_mouse_move_threshold = screen_diagonal / 4
         
         # 系统初始化完成（简化输出）
         
@@ -745,9 +745,22 @@ class EyeHandInteractionSystem:
         # 主循环标志
         self.running = True
         
+        # 导入keyboard库用于ESC键检测
+        try:
+            import keyboard
+        except ImportError:
+            print("Warning: keyboard library not found. ESC exit may not work properly.")
+            keyboard = None
+        
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
+                break
+            
+            # 检查ESC键退出（每几帧检查一次以提高性能）
+            if keyboard and keyboard.is_pressed('esc'):
+                print("检测到ESC键，程序将退出...")
+                self.running = False
                 break
             
             # 检测人脸和眼动

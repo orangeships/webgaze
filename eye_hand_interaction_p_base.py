@@ -83,17 +83,14 @@ class EyeHandInteractionUI:
         screen_geometry = screen.geometry()
         self.screen_width = screen_geometry.width()
         self.screen_height = screen_geometry.height()
-        
 
-        
         # 创建透明窗口
         self.window = TransparentWindow()
-        
+
         # 设置字体
         self.font_large = QFont("Microsoft YaHei", 30)
         self.font_medium = QFont("Microsoft YaHei", 20)
         self.font_small = QFont("Microsoft YaHei", 20)
-        
         return self.window
     
     def create_start_widget(self):
@@ -101,24 +98,23 @@ class EyeHandInteractionUI:
         widget = QWidget()
         widget.setStyleSheet("background-color: white;")
         widget.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        
         layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignCenter)
-        
+
         # 标题
         title_label = QLabel("眼手协同交互系统")
         title_label.setFont(self.font_large)
         title_label.setStyleSheet("color: black; background-color: white;")
         title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(title_label)
-        
+
         # 分辨率信息
         resolution_label = QLabel(f"分辨率: {self.screen_width}x{self.screen_height}")
         resolution_label.setFont(self.font_small)
         resolution_label.setStyleSheet("color: gray; background-color: white;")
         resolution_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(resolution_label)
-        
+
         # 说明文字
         instruction_label1 = QLabel("按 'S' 键开始校准")
         instruction_label1.setFont(self.font_medium)
@@ -283,7 +279,6 @@ class EyeHandInteractionUI:
                 if circle.update():
                     pass  # 圆圈已更新
                 else:
-                    # 动画完成，移除圆圈
                     self.current_widget.fade_circles.remove(circle)
             
             # 如果有活动的圆圈，重绘界面
@@ -465,26 +460,33 @@ class GazeDispersionAnalyzer:
             self.gaze_points.popleft()
     
     def calculate_dispersion(self):
-        """计算当前时间窗口内注视点的离散度"""
+        """计算当前时间窗口内注视点的离散度 - 使用中位数中心 + IQR方法"""
         if len(self.gaze_points) < 2:
             return {
                 'angle_dispersion': 0,
                 'pixel_dispersion': 0,
                 'point_count': len(self.gaze_points),
-                'geometric_center': None
+                'geometric_center': None,
+                'method_used': 'median_iqr'
             }
         
-        # 提取坐标
-        points = [(x, y) for _, x, y in self.gaze_points]
+        # 提取坐标并转换为numpy数组
+        points = np.array([(x, y) for _, x, y in self.gaze_points])
         
-        # 计算几何中心
-        center_x = sum(p[0] for p in points) / len(points)
-        center_y = sum(p[1] for p in points) / len(points)
-        geometric_center = (center_x, center_y)
+        # 使用中位数计算中心点（对离群值不敏感）
+        center_x = np.median(points[:, 0])
+        center_y = np.median(points[:, 1])
+        geometric_center = (float(center_x), float(center_y))
         
-        # 计算像素离散度（标准差）
-        pixel_distances = [math.sqrt((p[0] - center_x)**2 + (p[1] - center_y)**2) for p in points]
-        pixel_dispersion = math.sqrt(sum(d**2 for d in pixel_distances) / len(pixel_distances))
+        # 计算各点到中位数中心的距离
+        pixel_distances = np.sqrt((points[:, 0] - center_x)**2 + (points[:, 1] - center_y)**2)
+        
+        # 使用四分位距(IQR)代替标准差 - 更鲁棒的离散度度量
+        q75, q25 = np.percentile(pixel_distances, [75, 25])
+        iqr = q75 - q25
+        
+        # IQR本身就是一种变异程度的度量，我们直接使用它作为离散度指标
+        pixel_dispersion = float(iqr)
         
         # 计算角度离散度（相对于屏幕中心的角度变化）
         if hasattr(self, 'screen_width') and hasattr(self, 'screen_height'):
@@ -499,16 +501,18 @@ class GazeDispersionAnalyzer:
                 angle = math.degrees(math.atan2(dy, dx))
                 angles.append(angle)
             
-            # 计算角度离散度
+            # 计算角度离散度 - 使用IQR方法
             if angles:
-                angles.sort()
-                max_angle_diff = max(angles[-1] - angles[0], 360 - (angles[-1] - angles[0]))
-                angle_dispersion = min(max_angle_diff, 180)  # 最大角度差不超过180度
+                angles_array = np.array(angles)
+                # 使用角度的四分位距
+                angle_q75, angle_q25 = np.percentile(angles_array, [75, 25])
+                angle_iqr = angle_q75 - angle_q25
+                angle_dispersion = min(float(angle_iqr), 180)  # 限制在180度内
             else:
                 angle_dispersion = 0
         else:
             # 如果没有屏幕尺寸信息，使用像素离散度估算角度离散度
-            # 假设屏幕距离和尺寸，转换为近似角度
+            # 假设屏幕对角线长度，转换为近似角度
             screen_diagonal_pixels = 1920  # 假设
             angle_dispersion = (pixel_dispersion / screen_diagonal_pixels) * 180
         
@@ -516,7 +520,13 @@ class GazeDispersionAnalyzer:
             'angle_dispersion': angle_dispersion,
             'pixel_dispersion': pixel_dispersion,
             'point_count': len(self.gaze_points),
-            'geometric_center': geometric_center
+            'geometric_center': geometric_center,
+            'method_used': 'median_iqr',  # 标记使用的算法
+            'iqr_info': {  # 额外的调试信息
+                'q25': float(q25),
+                'q75': float(q75),
+                'iqr': pixel_dispersion
+            }
         }
     
     def check_trigger_conditions(self):
@@ -575,7 +585,7 @@ class EyeHandInteractionSystem:
         # 滑动窗口机制相关
         self.sliding_window_gaze_points = deque(maxlen=8)  # 滑动窗口，最多8个注视点
         self.sliding_window_start_time = None  # 滑动窗口开始时间
-        self.sliding_window_angle_threshold = 4.0  # 角度分布阈值 4°
+        self.sliding_window_angle_threshold = 3.0  # 角度分布阈值 4°
         self.sliding_window_time_limit = 350  # 滑动窗口时间限制 350ms
         
         # 鼠标自动移动相关
@@ -585,11 +595,11 @@ class EyeHandInteractionSystem:
         
         # 鼠标滑动窗口检测相关
         self.mouse_movement_window = deque(maxlen=8)  # 鼠标滑动窗口，最多8个位置点
-        self.mouse_movement_threshold = 15  # 鼠标移动触发阈值（像素）
+        self.mouse_movement_threshold = 30  # 鼠标移动触发阈值（像素）
         self.initial_mouse_position = None  # 鼠标初始位置
         self.teleport_circle_radius = 100  # 传送圆周半径（像素）
         
-        # 注视点平滑相关（替代卡尔曼滤波）
+        # 注视点平滑相
         self.gaze_history = deque(maxlen=6)  # 最近6个注视点用于平滑
         self.smoothing_enabled = True  # 平滑开关
         self.smoothing_threshold = 30  # 自适应平滑阈值（像素）
@@ -603,9 +613,21 @@ class EyeHandInteractionSystem:
     
     def _initialize_hand_eye_coordination(self):
         """初始化手眼协调机制"""
-        # 不需要再设置鼠标移动阈值，直接传送
+        # 设置鼠标自动移动触发距离阈值为屏幕对角线的1/4
+        if self.ui:
+            screen_width = self.ui.screen_width
+            screen_height = self.ui.screen_height
+        else:
+            # 如果UI尚未初始化，使用默认屏幕尺寸
+            screen = QApplication.primaryScreen()
+            screen_geometry = screen.geometry()
+            screen_width = screen_geometry.width()
+            screen_height = screen_geometry.height()
         
-
+        # 计算屏幕对角线的1/4作为鼠标移动触发阈值
+        screen_diagonal = np.sqrt(screen_width**2 + screen_height**2)
+        self.auto_mouse_move_threshold = screen_diagonal / 4
+        
         
     def initialize(self):
         """初始化系统"""
@@ -740,9 +762,22 @@ class EyeHandInteractionSystem:
         # 主循环标志
         self.running = True
         
+        # 导入keyboard库用于ESC键检测
+        try:
+            import keyboard
+        except ImportError:
+            print("Warning: keyboard library not found. ESC exit may not work properly.")
+            keyboard = None
+        
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
+                break
+            
+            # 检查ESC键退出（每几帧检查一次以提高性能）
+            if keyboard and keyboard.is_pressed('esc'):
+                print("检测到ESC键，程序将退出...")
+                self.running = False
                 break
             
             # 检测人脸和眼动
@@ -839,8 +874,6 @@ class EyeHandInteractionSystem:
                 except Exception:
                     pass
             
-
-            
             # 获取离散度信息
             dispersion_info = self.dispersion_analyzer.calculate_dispersion()
             
@@ -858,8 +891,6 @@ class EyeHandInteractionSystem:
             
             # 更新前一帧
             frame_prev = frame.copy()
-            
-
         
         timer.stop()
         self.ui.close_current_widget()
@@ -907,12 +938,10 @@ class EyeHandInteractionSystem:
         max_distance = max(distances) if distances else 0
         avg_distance = np.mean(distances) if distances else 0
         
-        
         # 检查是否满足视线稳定性条件（最大距离<150像素，平均距离<75像素）
         pixel_threshold = 150  # 最大分布距离阈值
         avg_pixel_threshold = 75  # 平均分布距离阈值
         
-       
         if max_distance < pixel_threshold and avg_distance < avg_pixel_threshold:
             # 第一个条件满足：注视点分布稳定
            # 第二个条件：检查鼠标移动条件并触发光标跳转
@@ -952,15 +981,9 @@ class EyeHandInteractionSystem:
                 # 第三个条件：当前鼠标与注视点距离必须大于400像素
                 if mouse_move_distance >= self.mouse_movement_threshold and gaze_cursor_distance > 400:
                     # 所有三个条件都满足：鼠标移动条件满足，传送到渐变圆圈位置（注视点）
-                    # 执行渐变圆圈传送（弹射逻辑）
+                    # 执行渐变圆圈传送
                     print(f"[DEBUG] ✅ 三个条件都满足：鼠标移动{mouse_move_distance:.2f}px, 注视点距离{gaze_cursor_distance:.2f}px")
                     self._trigger_fade_circle_cursor_move_and_reset(target_x, target_y)
-                else:
-                    print(f"[DEBUG] ❌ 条件不满足：鼠标移动{mouse_move_distance:.2f}px, 注视点距离{gaze_cursor_distance:.2f}px")
-                    if mouse_move_distance < self.mouse_movement_threshold:
-                        print(f"    - 鼠标移动距离不足: {mouse_move_distance:.2f} < {self.mouse_movement_threshold}")
-                    if gaze_cursor_distance <= 400:
-                        print(f"    - 鼠标与注视点距离不足: {gaze_cursor_distance:.2f} <= 400")
                     
         except Exception as e:
             print(f"[DEBUG] 鼠标移动检测异常: {e}")
@@ -1037,10 +1060,6 @@ class EyeHandInteractionSystem:
                     'teleport_x': target_x,
                     'teleport_y': target_y
                 }
-                print(f"绿色圆圈圆心: ({fade_circle_x:.2f}, {fade_circle_y:.2f})")
-                print(f"传送坐标: ({target_x:.2f}, {target_y:.2f})")
-                print(f"圆圈半径: 95像素")  # 从代码中看到半径是95
-                print("第一次传送完成，程序即将结束...")
                 
                 # 执行光标传送到渐变圆圈边界
                 self._auto_move_mouse_to_gaze(target_x, target_y)
@@ -1051,14 +1070,11 @@ class EyeHandInteractionSystem:
                 # 获取传送前的鼠标位置和传送后的光标位置
                 try:
                     final_cursor_pos = win32api.GetCursorPos()
-                    print(f"传送前鼠标位置: ({cursor_x}, {cursor_y})")
-                    print(f"传送后光标位置: ({final_cursor_pos[0]}, {final_cursor_pos[1]})")
                     # 计算位置差异
                     x_diff = final_cursor_pos[0] - cursor_x
                     y_diff = final_cursor_pos[1] - cursor_y
-                    print(f"位置差异: ({x_diff:+}, {y_diff:+})")
                 except Exception as e:
-                    print(f"获取光标位置失败: {e}")
+                    pass
                 
                 # 重置鼠标滑动窗口状态
                 self.mouse_movement_window.clear()
@@ -1177,31 +1193,42 @@ def main():
     app = QApplication(sys.argv)
     
     project_dir = os.path.dirname(os.path.abspath(__file__))
+    system = None
     
     try:
         # 创建交互系统
         system = EyeHandInteractionSystem(project_dir)
+        print("EyeHandInteractionSystem创建成功")
         
         # 初始化系统
         if not system.initialize():
+            print("系统初始化失败")
             return
+        
+        print("系统初始化成功")
         
         # 显示主菜单
         choice = system.show_menu()
         if choice == 'quit':
+            print("用户选择退出")
             return
         
         # 运行校准
         if not system.run_calibration():
+            print("校准失败")
             return
+        
+        print("校准成功")
         
         # 运行交互模式
         system.run_interaction_mode()
         
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"程序运行出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
     finally:
-        if 'system' in locals():
+        if system:
             system.cleanup()
         app.quit()
 

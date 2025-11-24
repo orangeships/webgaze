@@ -19,7 +19,7 @@ from sfm.linear_triangulation import linearTriangulation
 from sfm.draw_camera import drawCamera
 # from sfm.utils import invHomMatrix, fit_plane, rotation_matrix_to_align_plane
 import utilities.utils as util
-
+plt.rcParams['font.family'] = 'SimHei' 
 
 class SFM():
 

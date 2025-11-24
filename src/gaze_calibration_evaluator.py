@@ -1171,7 +1171,7 @@ class GazeCalibrationEvaluator:
             import matplotlib.pyplot as plt
             from matplotlib.backends.backend_agg import FigureCanvasAgg
             from matplotlib.patches import Ellipse, Circle
-            
+            plt.rcParams['font.family'] = 'SimHei' 
             # 创建图形
             fig = plt.figure(figsize=(15, 10), dpi=100)
             

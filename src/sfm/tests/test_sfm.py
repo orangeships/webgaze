@@ -5,6 +5,8 @@ import os
 
 from sfm.sfm_module import SFM
 from gaze_tracking.model import EyeModel
+plt.rcParams['font.family'] = 'SimHei' 
+
 
 
 class TestSFM(unittest.TestCase):

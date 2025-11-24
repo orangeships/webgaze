@@ -151,7 +151,7 @@ class PygameUI:
         
         pygame.display.flip()
     
-    def show_gaze_tracking_screen(self, frame, gaze_point=None, kalman_enabled=True):
+    def show_gaze_tracking_screen(self, frame, gaze_point=None, kalman_enabled=True, visual_3d_enabled=False):
         """显示视线追踪界面"""
         # 显示简单的追踪界面，不显示摄像头画面
         self.screen.fill(WHITE)
@@ -170,30 +170,50 @@ class PygameUI:
         if gaze_point:
             pygame.draw.circle(self.screen, RED, gaze_point, 15)
         
-        # 卡尔曼滤波状态显示和切换按钮
+        # 卡尔曼滤波状态显示
         kalman_status = "启用" if kalman_enabled else "禁用"
         kalman_color = GREEN if kalman_enabled else RED
         kalman_text = self.font_small.render(f"卡尔曼滤波: {kalman_status}", True, kalman_color)
         kalman_rect = kalman_text.get_rect(center=(self.width // 2, self.height // 2 + 80))
         self.screen.blit(kalman_text, kalman_rect)
         
-        # 切换按钮
+        # 3D可视化状态显示
+        visual_3d_status = "启用" if visual_3d_enabled else "禁用"
+        visual_3d_color = BLUE if visual_3d_enabled else GRAY
+        visual_3d_text = self.font_small.render(f"3D姿态显示: {visual_3d_status}", True, visual_3d_color)
+        visual_3d_rect = visual_3d_text.get_rect(center=(self.width // 2, self.height // 2 + 120))
+        self.screen.blit(visual_3d_text, visual_3d_rect)
+        
+        # 创建两个按钮
         toggle_button_rect = self.draw_button(
             "切换滤波", 
             self.width // 2 - 100, 
-            self.height // 2 + 120, 
+            self.height // 2 + 160, 
             200, 50, 
             kalman_color
         )
         
+        toggle_3d_button_rect = self.draw_button(
+            "切换3D显示", 
+            self.width // 2 - 100, 
+            self.height // 2 + 220, 
+            200, 50, 
+            visual_3d_color
+        )
+        
+        # 快捷键说明
+        shortcut_text = self.font_small.render("快捷键: F-滤波, D-3D显示, ESC-退出", True, GRAY)
+        shortcut_rect = shortcut_text.get_rect(center=(self.width // 2, 3 * self.height // 4))
+        self.screen.blit(shortcut_text, shortcut_rect)
+        
         # 退出说明
         exit_text = self.font_small.render("按ESC键退出", True, GRAY)
-        exit_rect = exit_text.get_rect(center=(self.width // 2, 3 * self.height // 4))
+        exit_rect = exit_text.get_rect(center=(self.width // 2, 3 * self.height // 4 + 40))
         self.screen.blit(exit_text, exit_rect)
         
         pygame.display.flip()
         
-        return toggle_button_rect
+        return toggle_button_rect, toggle_3d_button_rect
     
     def handle_events(self):
         """处理事件"""
@@ -205,6 +225,10 @@ class PygameUI:
                     return 'quit'
                 elif event.key == pygame.K_s:
                     return 'start'
+                elif event.key == pygame.K_f:
+                    return 'toggle_kalman'
+                elif event.key == pygame.K_d:
+                    return 'toggle_3d'
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 return 'click'
         return None
@@ -221,6 +245,10 @@ class PygameGazeSystem:
         # 参数调整: process_noise越小，滤波越平滑；measurement_noise越小，越信任测量值
         self.kalman_filter = KalmanFilter(process_noise=0.01, measurement_noise=2.0, error_estimate=1.0)
         self.kalman_enabled = True  # 卡尔曼滤波开关，默认为启用
+        
+        # 3D可视化器
+        self.visual_3d = None
+        self.visual_3d_enabled = False  # 3D可视化开关，默认为禁用
         
     def initialize(self):
         """初始化系统"""
@@ -388,6 +416,18 @@ class PygameGazeSystem:
         # 用于SfM的前一帧
         frame_prev = None
         
+        # 初始化3D可视化器
+        try:
+            self.visual_3d = RealTime3DVisualizer(
+                project_root=self.project_dir,
+                homtransform_instance=self.homtrans,
+                sfm_module=self.homtrans.sfm
+            )
+            print("3D可视化器初始化成功")
+        except Exception as e:
+            print(f"3D可视化器初始化失败: {e}")
+            self.visual_3d = None
+        
         # 移除本地缓存变量，直接使用SFM模块内部的缓存机制
         # cached_face_features_prev = None
         # cached_face_features_curr = None
@@ -482,18 +522,75 @@ class PygameGazeSystem:
                 frame_count = 0
                 fps_start_time = current_time
             
+            # 更新3D可视化（如果启用）
+            if self.visual_3d_enabled and self.visual_3d is not None:
+                try:
+                    # 获取当前帧的人脸特征点
+                    face_features_curr = self.model.get_FaceFeatures(frame, face_boxes=face_boxes)
+                    
+                    # 更新3D可视化数据
+                    self.visual_3d.update_data(
+                        frame=frame,
+                        model=self.model,
+                        face_features_prev=None,  # 使用缓存的前一帧数据
+                        face_features_curr=face_features_curr
+                    )
+                except Exception as e:
+                    print(f"3D可视化更新失败: {e}")
+            
             # 显示结果
-            toggle_button_rect = self.ui.show_gaze_tracking_screen(frame, gaze_point, self.kalman_enabled)
+            toggle_button_rect, toggle_3d_button_rect = self.ui.show_gaze_tracking_screen(
+                frame, gaze_point, self.kalman_enabled, self.visual_3d_enabled)
             
             event = self.ui.handle_events()
             if event == 'quit':
                 break
+            elif event == 'toggle_kalman':
+                # 切换卡尔曼滤波状态
+                self.kalman_enabled = not self.kalman_enabled
+                print(f"卡尔曼滤波已{'启用' if self.kalman_enabled else '禁用'}")
+            elif event == 'toggle_3d':
+                # 切换3D可视化状态
+                if not self.visual_3d_enabled:
+                    # 启用3D可视化
+                    if self.visual_3d is not None:
+                        if self.visual_3d.start_visualization():
+                            self.visual_3d_enabled = True
+                            print("3D姿态显示已启用")
+                        else:
+                            print("3D可视化启动失败")
+                    else:
+                        print("3D可视化器未初始化")
+                else:
+                    # 禁用3D可视化
+                    if self.visual_3d is not None:
+                        self.visual_3d.stop_visualization()
+                    self.visual_3d_enabled = False
+                    print("3D姿态显示已禁用")
             elif event == 'click':
                 mouse_pos = pygame.mouse.get_pos()
                 if toggle_button_rect.collidepoint(mouse_pos):
                     # 切换卡尔曼滤波状态
                     self.kalman_enabled = not self.kalman_enabled
                     print(f"卡尔曼滤波已{'启用' if self.kalman_enabled else '禁用'}")
+                elif toggle_3d_button_rect.collidepoint(mouse_pos):
+                    # 切换3D可视化状态
+                    if not self.visual_3d_enabled:
+                        # 启用3D可视化
+                        if self.visual_3d is not None:
+                            if self.visual_3d.start_visualization():
+                                self.visual_3d_enabled = True
+                                print("3D姿态显示已启用")
+                            else:
+                                print("3D可视化启动失败")
+                        else:
+                            print("3D可视化器未初始化")
+                    else:
+                        # 禁用3D可视化
+                        if self.visual_3d is not None:
+                            self.visual_3d.stop_visualization()
+                        self.visual_3d_enabled = False
+                        print("3D姿态显示已禁用")
             
             # 提高帧率限制，以展示缓存机制带来的性能提升
             # 移除固定帧率限制，让程序以最大可能速度运行
@@ -539,6 +636,11 @@ class PygameGazeSystem:
     
     def cleanup(self):
         """清理资源"""
+        # 停止3D可视化
+        if self.visual_3d is not None and self.visual_3d_enabled:
+            self.visual_3d.stop_visualization()
+            self.visual_3d_enabled = False
+        
         if self.cap:
             self.cap.release()
         pygame.quit()
