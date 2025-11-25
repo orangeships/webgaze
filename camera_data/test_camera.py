@@ -139,7 +139,7 @@ def image_calibration():
     print("请准备包含棋盘格的图片文件夹")
     
     # 获取用户输入的图片文件夹路径
-    default_path = os.path.join(os.getcwd(), "data")
+    default_path = os.path.join(os.getcwd(), "camera_data\data")
     folder_path = input(f"请输入图片文件夹路径 (直接回车使用 '{default_path}'): ").strip()
     
     if not folder_path:

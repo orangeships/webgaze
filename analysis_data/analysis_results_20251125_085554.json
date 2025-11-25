@@ -1,0 +1,21 @@
+{
+  "target_center_x": 1280,
+  "target_center_y": 720,
+  "target_radius": 360,
+  "user_center_x": 1118.8101806640625,
+  "user_center_y": 847.4329833984375,
+  "user_semi_major": 411.5456237792969,
+  "user_semi_minor": 619.46484375,
+  "user_angle": 67.69952392578125,
+  "center_distance": 205.47827893813647,
+  "circularity": 0.6643567071344343,
+  "radius_ratio": 1.1431822882758247,
+  "position_similarity": 71.46135014748104,
+  "shape_similarity": 66.43567071344343,
+  "size_similarity": 85.68177117241753,
+  "overall_similarity": 72.2951625788533,
+  "mean_distance_to_ellipse": 321.32761689468026,
+  "median_distance_to_ellipse": 266.5196311340661,
+  "sample_count": 478,
+  "ellipse_fit_successful": true
+}
