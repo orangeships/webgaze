@@ -212,10 +212,7 @@ class SimpleHandDetectionSystem:
             tuple: (bool, dict) - (是否接触, 调试信息)
         """
         if not landmarks_2d or len(landmarks_2d) < 21:
-            print(f"[DEBUG] 关键点不足: {len(landmarks_2d) if landmarks_2d else 'None'}")
             return False, {"error": "关键点不足"}
-        
-        print(f"[DEBUG] 开始检测，关键点数量: {len(landmarks_2d)}")
         
         # 获取大拇指关键点 (0-4号点) - 使用原始坐标，不要放大
         thumb_points = []
@@ -224,7 +221,7 @@ class SimpleHandDetectionSystem:
             y = landmarks_2d[i][1]  # 原始归一化坐标
             z = i * 0.01  # 减小z坐标差异，基于点的顺序设置不同的深度
             thumb_points.append([x, y, z])
-            print(f"[DEBUG] 大拇指点{i}: ({x:.4f}, {y:.4f}, {z:.4f})")
+            # print(f"[DEBUG] 大拇指点{i}: ({x:.4f}, {y:.4f}, {z:.4f})")
         
         # 获取食指指尖点 (8号点) - 使用原始坐标
         finger_tip = landmarks_2d[8]
@@ -232,30 +229,25 @@ class SimpleHandDetectionSystem:
         finger_y = finger_tip[1]  # 原始归一化坐标
         finger_z = 0.03  # 稍微调整z坐标
         
-        print(f"[DEBUG] 食指指尖: ({finger_x:.4f}, {finger_y:.4f}, {finger_z:.4f})")
+        # print(f"[DEBUG] 食指指尖: ({finger_x:.4f}, {finger_y:.4f}, {finger_z:.4f})")
         
         # 使用大拇指三个点构建参考平面 (0, 2, 4)
         p1 = np.array(thumb_points[0])  # 手腕
         p2 = np.array(thumb_points[2])  # 大拇指中间
         p3 = np.array(thumb_points[4])  # 大拇指指尖
         
-        print(f"[DEBUG] 参考平面点:")
-        print(f"[DEBUG]   p1 (手腕): {p1}")
-        print(f"[DEBUG]   p2 (拇指中): {p2}")
-        print(f"[DEBUG]   p3 (拇指尖): {p3}")
-        
         # 计算平面法向量
         v1 = p2 - p1
         v2 = p3 - p1
         normal = np.cross(v1, v2)
         
-        print(f"[DEBUG] 向量 v1: {v1}")
-        print(f"[DEBUG] 向量 v2: {v2}")
-        print(f"[DEBUG] 法向量: {normal}")
+        # print(f"[DEBUG] 向量 v1: {v1}")
+        # print(f"[DEBUG] 向量 v2: {v2}")
+        # print(f"[DEBUG] 法向量: {normal}")
         
         # 如果法向量过小，说明点共线，无法构成平面
         if np.linalg.norm(normal) < 1e-6:
-            print(f"[DEBUG] 法向量过小: {np.linalg.norm(normal)}")
+            # print(f"[DEBUG] 法向量过小: {np.linalg.norm(normal)}")
             return False, {"error": "参考点共线，无法构成平面"}
         
         # 归一化法向量
@@ -268,13 +260,13 @@ class SimpleHandDetectionSystem:
         # 点到平面的距离公式: |n·(p - p0)| / ||n||
         distance = abs(np.dot(normal, finger_point - plane_point)) / np.linalg.norm(normal)
         
-        print(f"[DEBUG] 原始距离: {distance:.6f}")
+        # print(f"[DEBUG] 原始距离: {distance:.6f}")
         
         # 将距离转换为像素单位（基于图像尺寸）
         # 假设图像是1280x720，归一化坐标转换为像素
         distance_pixels = distance * 1280  # 使用图像宽度作为参考
         
-        print(f"[DEBUG] 转换后距离: {distance_pixels:.6f} 像素")
+        # print(f"[DEBUG] 转换后距离: {distance_pixels:.6f} 像素")
         
         # 计算夹角：计算从平面中心到食指指尖的向量与平面法向量的夹角
         # 向量从平面中心到指尖
@@ -289,8 +281,8 @@ class SimpleHandDetectionSystem:
         angle_with_plane_radians = (np.pi / 2) - angle_with_normal_radians
         angle_degrees = np.degrees(angle_with_plane_radians)
         
-        print(f"[DEBUG] 与法向量夹角: {np.degrees(angle_with_normal_radians):.2f} 度")
-        print(f"[DEBUG] 与平面夹角: {angle_degrees:.2f} 度")
+        # print(f"[DEBUG] 与法向量夹角: {np.degrees(angle_with_normal_radians):.2f} 度")
+        # print(f"[DEBUG] 与平面夹角: {angle_degrees:.2f} 度")
         
         # 设置接触阈值（以角度为单位）
         contact_threshold_degrees = 10  # 10度夹角作为阈值
@@ -298,10 +290,9 @@ class SimpleHandDetectionSystem:
         # 额外检查：确保大拇指关键点形成的平面是合理的
         # 检查三个参考点的分散程度
         plane_area = 0.5 * np.linalg.norm(np.cross(v1, v2))
-        print(f"[DEBUG] 平面面积: {plane_area:.6f}")
+        # print(f"[DEBUG] 平面面积: {plane_area:.6f}")
         
         if plane_area < 0.0001:  # 降低面积阈值，允许更小的平面
-            print(f"[DEBUG] 平面面积过小: {plane_area:.6f}")
             return False, {"error": f"参考平面面积过小: {plane_area:.6f}"}
         
         # 基于夹角判断接触
@@ -550,8 +541,8 @@ class SimpleHandDetectionSystem:
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='手部关键点检测系统 (简化版)')
-    parser.add_argument('--camera', type=int, default=1, help='摄像头索引')
-    parser.add_argument('--max_hands', type=int, default=2, help='最大检测手部数')
+    parser.add_argument('--camera', type=int, default=2, help='摄像头索引')
+    parser.add_argument('--max_hands', type=int, default=1, help='最大检测手部数')
     parser.add_argument('--detection_conf', type=float, default=0.7, help='检测置信度')
     
     args = parser.parse_args()

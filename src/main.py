@@ -37,7 +37,7 @@ def main(dir):
         
         if choice == "1":
             # 尝试加载历史校准数据
-            calibration_file = os.path.join(dir, "results", "calibration_results.pkl")
+            calibration_file = os.path.join(dir, "results", "calibration_results.json")
             if os.path.exists(calibration_file):
                 print(f"正在加载历史校准数据: {calibration_file}")
                 if homtrans.load_calibration_results(calibration_file):

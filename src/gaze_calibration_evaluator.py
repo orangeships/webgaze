@@ -128,7 +128,7 @@ class GazeCalibrationEvaluator:
     
     def load_calibration(self):
         """加载校准数据"""
-        calibration_file = os.path.join(self.project_dir, "results", "calibration_results.pkl")
+        calibration_file = os.path.join(self.project_dir, "results", "calibration_results.json")
         if os.path.exists(calibration_file):
             print(f"加载校准数据: {calibration_file}")
             if self.homtrans.load_calibration_results(calibration_file):

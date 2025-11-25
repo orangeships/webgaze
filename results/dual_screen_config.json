@@ -1,0 +1,34 @@
+{
+  "timestamp": "2025-11-25T18:25:31.896976",
+  "total_screens": 2,
+  "screens": {
+    "0": {
+      "index": 1,
+      "name": "屏幕1",
+      "width": 2560,
+      "height": 1440,
+      "left": 0,
+      "top": 0,
+      "right": 2560,
+      "bottom": 1440,
+      "center_x": 1280,
+      "center_y": 720,
+      "position": "front",
+      "calibration_data": true
+    },
+    "1": {
+      "index": 2,
+      "name": "屏幕2",
+      "width": 1920,
+      "height": 1080,
+      "left": 2560,
+      "top": 148,
+      "right": 4480,
+      "bottom": 1228,
+      "center_x": 3520,
+      "center_y": 688,
+      "position": "right",
+      "calibration_data": true
+    }
+  }
+}
