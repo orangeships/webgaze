@@ -721,7 +721,7 @@ class EyeHandInteractionSystem:
         self.ui.close_current_widget()
         
         if choice == 'load':
-            calibration_file = os.path.join(self.project_dir, "results", "calibration_results.pkl")
+            calibration_file = os.path.join(self.project_dir, "results", "calibration_results.json")
             if os.path.exists(calibration_file):
                 if self.homtrans.load_calibration_results(calibration_file):
                     self.calibration_data = self.homtrans.STransG

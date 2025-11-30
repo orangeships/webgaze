@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 # 从calibration_pygame导入工具函数，不再使用gui_opencv
-from gaze_tracking.calibration_pygame import PygameCalibrationUI, PygameCalibrationTargets, getScreenSize, getAllScreensInfo, getWhiteFrame, ReadCameraCalibrationData, MultiScreenCalibrationManager
+from gaze_tracking.calibration_pygame import PygameCalibrationUI, PygameCalibrationTargets, getScreenSize, getWhiteFrame, ReadCameraCalibrationData
 from sfm.sfm_module import SFM
 import utilities.utils as util
 
@@ -38,17 +38,6 @@ class HomTransform:
         
         # 调试计数器
         self.debug_counter = 0  # 调试计数器
-        
-        # 支持多屏幕参数
-        self.screen_configs = getAllScreensInfo()
-        self.current_screen_index = 0  # 默认使用第一个屏幕
-        
-        print(f"初始化HomTransform - 检测到 {len(self.screen_configs)} 个屏幕")
-        for i, screen in enumerate(self.screen_configs):
-            print(f"  屏幕{i+1}: {screen['width']}x{screen['height']} 位置({screen['left']}, {screen['top']})")
-        
-        # 修复：确保_mm2pixel使用当前屏幕参数
-        self._update_current_screen_parameters()
 
     def RecordGaze(self, model, cap, sfm=False):
         df = pd.DataFrame()
@@ -96,27 +85,9 @@ class HomTransform:
         # 创建白色帧用于处理
         white_frame = getWhiteFrame(self.width, self.height)
         
-        # 使用多屏幕校准管理器，支持不同屏幕尺寸适配
-        targets = None
-        
-        # 检测当前可用的屏幕配置
-        screen_configs = getAllScreensInfo()
-        
-        if len(screen_configs) > 1:
-            # 多屏幕环境：使用多屏幕校准管理器
-            print("检测到多屏幕环境，使用多屏幕校准管理器...")
-            
-            # 创建多屏幕校准管理器
-            screen_manager = MultiScreenCalibrationManager(screen_configs)
-            
-            # 使用主屏幕（索引0）的校准目标管理器
-            targets = screen_manager.get_screen_calibrator(0)
-            
-            print(f"使用屏幕1 ({self.width}x{self.height}) 进行视线跟踪")
-        else:
-            # 单屏幕环境：使用传统的校准目标管理器
-            print("单屏幕环境，使用传统校准目标管理器")
-            targets = PygameCalibrationTargets(self.width, self.height)
+        # 移除OpenCV渲染器，使用Pygame相关功能
+        # 这里使用PygameCalibrationTargets替代OpenCV的Targets
+        targets = PygameCalibrationTargets(self.width, self.height)
         frame_prev = None
         WTransG1 = np.eye(4)
         targets.setSetPos([int(self.width/8), int(self.height/8)])   # for DrawSpecificTarget()
@@ -271,87 +242,19 @@ class HomTransform:
             print("错误：Pygame未安装，无法进行校准")
             return None
             
-        # 使用单屏幕校准模式（使用主屏幕配置）
-        screen_config = {
-            'name': '主屏幕',
-            'width': self.width,
-            'height': self.height,
-            'left': 0,
-            'top': 0,
-            'index': 0
-        }
-        
-        return self._calibrate_pygame_screen(model, cap, screen_config, sfm)
+        return self._calibrate_pygame(model, cap, sfm)
     
-    def calibrate_screen(self, model, cap, screen_config, sfm=False):
-        """
-        指定屏幕的校准方法 - 支持多屏幕校准
+    def _calibrate_pygame(self, model, cap, sfm=False):
+        """Pygame版本的校准方法"""
+        print("使用Pygame校准界面...")
         
-        Args:
-            model: 视线估计模型
-            cap: 摄像头捕获对象
-            screen_config: 屏幕配置字典，包含width, height, left, top等信息
-            sfm: 是否使用SfM（结构光）
-            
-        Returns:
-            STransG: 校准变换矩阵，如果取消则返回None
-        """
-        if not PYGAME_AVAILABLE:
-            print("错误：Pygame未安装，无法进行校准")
-            return None
-            
-        return self._calibrate_pygame_screen(model, cap, screen_config, sfm)
-    
-    def _calibrate_pygame_screen(self, model, cap, screen_config, sfm=False):
-        """指定屏幕的Pygame校准方法 - 支持多屏幕校准"""
-        print(f"使用Pygame校准界面校准屏幕: {screen_config['name']} ({screen_config['width']}x{screen_config['height']})...")
+        # 初始化Pygame（如果尚未初始化）
+        if not pygame.get_init():
+            pygame.init()
         
-        try:
-            # 初始化Pygame（如果尚未初始化）
-            if not pygame.get_init():
-                pygame.init()
-            
-            # 创建Pygame校准界面，使用指定屏幕的尺寸和位置
-            calib_ui = PygameCalibrationUI(screen_config['width'], screen_config['height'])
-            # 使用窗口模式以便在正确的屏幕位置显示
-            screen_index = screen_config.get('index', 0)
-            
-            # 确保窗口显示在正确的屏幕上
-            screen_x = screen_config.get('left', 0)
-            screen_y = screen_config.get('top', 0)
-            
-            # 设置屏幕偏移信息（用于内部坐标计算）
-            screen_offset = {
-                'x': screen_x,
-                'y': screen_y
-            }
-            calib_ui.screen_offset = screen_offset
-            calib_ui.screen_index = screen_index
-            
-            print(f"正在屏幕{screen_index + 1}上创建校准窗口: 位置({screen_x}, {screen_y}), 尺寸{screen_config['width']}x{screen_config['height']}")
-            
-            # 初始化校准界面
-            calib_ui.initialize(
-                x=screen_x, 
-                y=screen_y, 
-                fullscreen=False,  # 使用窗口模式以便精确定位
-                screen_index=screen_index
-            )
-            
-            print(f"屏幕{screen_index + 1}校准界面创建成功")
-            
-        except Exception as e:
-            print(f"创建屏幕{screen_index + 1}校准界面时出错: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-        
-        # 保存原始屏幕尺寸
-        original_width, original_height = self.width, self.height
-        
-        # 临时设置当前屏幕的尺寸和位置
-        self.width = screen_config['width']
-        self.height = screen_config['height']
+        # 创建Pygame校准界面
+        calib_ui = PygameCalibrationUI(self.width, self.height)
+        calib_ui.initialize()
         
         # 获取摄像头尺寸
         if cap is not None:
@@ -405,27 +308,8 @@ class HomTransform:
         
         print("模型预热完成，开始正式校准流程")
         
-        # 创建校准目标管理器 - 支持多屏幕适配
-        if screen_index is not None and hasattr(self, 'all_screen_calibrations'):
-            # 获取参考屏幕的配置
-            reference_screen_config = self.get_reference_screen_config()
-            
-            # 为当前屏幕创建适配的校准目标管理器
-            calib_targets = PygameCalibrationTargets(
-                width=screen_config['width'],
-                height=screen_config['height'],
-                screen_config=screen_config,
-                reference_screen=reference_screen_config
-            )
-        else:
-            # 单屏幕模式
-            calib_targets = PygameCalibrationTargets(
-                width=self.width,
-                height=self.height,
-                screen_config=screen_config,
-                reference_screen=None
-            )
-        
+        # 创建校准目标管理器
+        calib_targets = PygameCalibrationTargets(self.width, self.height)
         calib_targets.start_timing()
         
         # 校准主循环
@@ -514,18 +398,13 @@ class HomTransform:
         self._WriteStatsInFile(STransG)
         
         # 保存校准结果
-        self._save_calibration_results(STransG, g, SetVal, gaze, sfm, STransW if sfm else None, scaleWtG if sfm else None, screen_config)
-        
-        # 恢复原始屏幕尺寸
-        self.width = original_width
-        self.height = original_height
+        self._save_calibration_results(STransG, g, SetVal, gaze, sfm, STransW if sfm else None, scaleWtG if sfm else None)
         
         return STransG
     
-    def _save_calibration_results(self, STransG, g, SetVal, gaze, sfm=False, STransW=None, scaleWtG=None, screen_info=None):
+    def _save_calibration_results(self, STransG, g, SetVal, gaze, sfm=False, STransW=None, scaleWtG=None):
         """
-        保存完整的校准结果，包括设备信息和校准点数据
-        支持多屏幕校准数据保存
+        保存完整的校准结果，包括设备信息和校准点数据（仅JSON格式）
         """
         import json
         import numpy as np
@@ -544,31 +423,14 @@ class HomTransform:
                 # 对于其他类型，尝试转换为字符串
                 return str(obj)
         
-        # 获取屏幕信息
-        screen_index = screen_info.get('index', 0) if screen_info else 0
-        screen_name = screen_info.get('name', f'Screen_{screen_index}') if screen_info else 'Screen_0'
-        
         # 创建校准结果字典
         calibration_data = {
             'timestamp': datetime.datetime.now().isoformat(),
-            'screen_info': {
-                'index': screen_index,
-                'name': screen_name,
+            'device_info': {
                 'screen_width': self.width,
                 'screen_height': self.height,
                 'screen_width_mm': self.width_mm,
                 'screen_height_mm': self.height_mm,
-                'position': screen_info.get('position', 'unknown') if screen_info else 'unknown',
-                'x': screen_info.get('x', 0) if screen_info else 0,
-                'y': screen_info.get('y', 0) if screen_info else 0,
-                'left': screen_info.get('left', 0) if screen_info else 0,
-                'top': screen_info.get('top', 0) if screen_info else 0,
-                'right': screen_info.get('right', self.width) if screen_info else self.width,
-                'bottom': screen_info.get('bottom', self.height) if screen_info else self.height,
-                'center_x': screen_info.get('center_x', self.width // 2) if screen_info else self.width // 2,
-                'center_y': screen_info.get('center_y', self.height // 2) if screen_info else self.height // 2
-            },
-            'device_info': {
                 'webcam_width': self.WC_width,
                 'webcam_height': self.WC_height,
                 'camera_matrix': convert_to_serializable(self.camera_matrix),
@@ -599,240 +461,54 @@ class HomTransform:
                 'StW': [stw.tolist() for stw in self.StW] if hasattr(self, 'StW') else []
             }
         
-        # 保存为屏幕特定的JSON文件
-        json_file = os.path.join(self.dir, "results", f"calibration_results_screen_{screen_index}.json")
+        # 保存为JSON文件
+        json_file = os.path.join(self.dir, "results", "calibration_results.json")
         with open(json_file, 'w', encoding='utf-8') as f:
             json.dump(calibration_data, f, indent=2, ensure_ascii=False)
         
-        # 同时更新主校准文件（包含所有屏幕的信息）
-        self._update_master_calibration_file(calibration_data, screen_index)
-        
-        print(f"屏幕 {screen_index} ({screen_name}) 校准结果已保存到: {json_file}")
-        
-        return json_file, json_file
+        print(f"校准结果已保存到: {json_file}")
 
-    def _update_master_calibration_file(self, calibration_data, screen_index):
+    def load_calibration_results(self, file_path=None):
         """
-        更新主校准文件，包含所有屏幕的校准信息
+        从JSON文件加载校准结果
         """
         import json
+        import numpy as np
         
-        master_json_file = os.path.join(self.dir, "results", "calibration_results.json")
+        if file_path is None:
+            file_path = os.path.join(self.dir, "results", "calibration_results.json")
         
-        # 加载现有的主校准文件（如果存在）
-        master_data = {
-            'timestamp': datetime.datetime.now().isoformat(),
-            'total_screens': 0,
-            'screens': {},
-            'device_info': calibration_data['device_info']
-        }
+        if not os.path.exists(file_path):
+            print(f"校准文件不存在: {file_path}")
+            return False
         
-        if os.path.exists(master_json_file):
-            try:
-                with open(master_json_file, 'r', encoding='utf-8') as f:
-                    existing_data = json.load(f)
-                    if 'screens' in existing_data:
-                        master_data['screens'] = existing_data['screens']
-                        master_data['total_screens'] = existing_data.get('total_screens', 0)
-            except:
-                pass
-        
-        # 添加当前屏幕的校准数据
-        master_data['screens'][str(screen_index)] = calibration_data
-        master_data['total_screens'] = len(master_data['screens'])
-        
-        # 保存更新后的主校准文件
-        with open(master_json_file, 'w', encoding='utf-8') as f:
-            json.dump(master_data, f, indent=2, ensure_ascii=False)
-
-    def load_calibration_results(self, file_path=None, screen_index=None):
-        """
-        从文件加载校准结果
-        支持加载特定屏幕或所有屏幕的校准数据
-        """
-        import json
-        
-        # 如果指定了屏幕索引，加载特定屏幕的校准文件
-        if screen_index is not None:
-            if file_path is None:
-                file_path = os.path.join(self.dir, "results", f"calibration_results_screen_{screen_index}.json")
-            
-            if not os.path.exists(file_path):
-                print(f"屏幕 {screen_index} 校准文件不存在: {file_path}")
-                return False
-            
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    calibration_data = json.load(f)
-                
-                # 恢复校准状态
-                self.STransG = np.array(calibration_data['transformation_matrices']['STransG'])
-                self.StG = [np.array(stg) for stg in calibration_data['transformation_matrices']['StG']]
-                self.SetValues = calibration_data['calibration_points']['SetValues']
-                
-                # 恢复SfM相关数据（如果存在）
-                if calibration_data.get('sfm_data'):
-                    self.STransW = np.array(calibration_data['sfm_data']['STransW'])
-                    self.scaleWtG = calibration_data['sfm_data']['scaleWtG']
-                    self.StW = [np.array(stw) for stw in calibration_data['sfm_data']['StW']]
-                
-                # 保存屏幕信息
-                self.screen_info = calibration_data.get('screen_info', {})
-                
-                print(f"屏幕 {screen_index} ({calibration_data['screen_info'].get('name', 'Unknown')}) 校准结果已加载")
-                print(f"屏幕尺寸: {calibration_data['screen_info']['screen_width']}x{calibration_data['screen_info']['screen_height']}")
-                print(f"校准点数: {len(calibration_data['calibration_points']['gaze_data'])}")
-                print(f"SfM启用: {calibration_data['calibration_parameters']['sfm_enabled']}")
-                
-                return True
-                
-            except Exception as e:
-                print(f"加载屏幕 {screen_index} 校准结果失败: {e}")
-                return False
-        
-        else:
-            # 加载主校准文件（包含所有屏幕的信息）
-            if file_path is None:
-                file_path = os.path.join(self.dir, "results", "calibration_results.json")
-            
-            if not os.path.exists(file_path):
-                print(f"主校准文件不存在: {file_path}")
-                return False
-            
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    master_data = json.load(f)
-                
-                # 保存所有屏幕的校准数据
-                self.all_screen_calibrations = master_data.get('screens', {})
-                self.total_screens = master_data.get('total_screens', 0)
-                
-                print(f"主校准文件已加载，包含 {self.total_screens} 个屏幕的校准数据")
-                
-                # 默认加载第一个屏幕的校准数据
-                if self.total_screens > 0:
-                    first_screen_key = sorted(self.all_screen_calibrations.keys())[0]
-                    first_screen_data = self.all_screen_calibrations[first_screen_key]
-                    
-                    # 恢复第一个屏幕的校准状态
-                    if 'transformation_matrices' in first_screen_data:
-                        self.STransG = np.array(first_screen_data['transformation_matrices']['STransG'])
-                        self.StG = [np.array(stg) for stg in first_screen_data['transformation_matrices']['StG']]
-                        self.SetValues = first_screen_data['calibration_points']['SetValues']
-                    
-                    print(f"默认加载屏幕 {first_screen_key} 的校准数据")
-                
-                return True
-                
-            except Exception as e:
-                print(f"加载主校准文件失败: {e}")
-                return False
-    
-    def load_screen_calibration(self, screen_index):
-        """
-        加载指定屏幕的校准数据
-        """
-        return self.load_calibration_results(screen_index=screen_index)
-    
-    def get_screen_calibration_data(self, screen_index):
-        """
-        获取指定屏幕的校准数据
-        """
-        if hasattr(self, 'all_screen_calibrations') and str(screen_index) in self.all_screen_calibrations:
-            return self.all_screen_calibrations[str(screen_index)]
-        return None
-    
-    def get_reference_screen_config(self):
-        """
-        获取参考屏幕的配置信息（通常是第一个屏幕）
-        用于多屏幕校准时的尺寸适配
-        
-        Returns:
-            PygameCalibrationTargets: 参考屏幕的校准目标管理器实例
-        """
         try:
-            # 如果已有多个屏幕的校准数据，选择第一个作为参考
-            if hasattr(self, 'all_screen_calibrations') and self.all_screen_calibrations:
-                # 获取第一个屏幕的配置
-                first_screen_key = sorted(self.all_screen_calibrations.keys())[0]
-                first_screen_data = self.all_screen_calibrations[first_screen_key]
-                
-                if 'screen_info' in first_screen_data:
-                    screen_info = first_screen_data['screen_info']
-                    
-                    # 创建参考屏幕的校准目标管理器
-                    reference_targets = PygameCalibrationTargets(
-                        width=screen_info['screen_width'],
-                        height=screen_info['screen_height'],
-                        screen_config={'index': int(first_screen_key)},
-                        reference_screen=None
-                    )
-                    
-                    print(f"使用屏幕{first_screen_key}作为参考屏幕: {screen_info['screen_width']}x{screen_info['screen_height']}")
-                    return reference_targets
+            with open(file_path, 'r', encoding='utf-8') as f:
+                calibration_data = json.load(f)
             
-            # 如果没有现有的校准数据，创建一个默认的参考屏幕配置
-            default_reference = PygameCalibrationTargets(
-                width=1920,  # 默认宽度
-                height=1080,  # 默认高度
-                screen_config={'index': 0},
-                reference_screen=None
-            )
+            # 恢复校准状态
+            self.STransG = np.array(calibration_data['transformation_matrices']['STransG'])
+            self.StG = [np.array(stg) for stg in calibration_data['transformation_matrices']['StG']]
+            self.SetValues = [np.array(setval) for setval in calibration_data['calibration_points']['SetValues']]
             
-            print(f"使用默认参考屏幕: 1920x1080")
-            return default_reference
+            # 恢复SfM相关数据（如果存在）
+            if calibration_data['calibration_parameters']['sfm_enabled'] and 'sfm_data' in calibration_data:
+                self.STransW = np.array(calibration_data['sfm_data']['STransW'])
+                self.scaleWtG = calibration_data['sfm_data']['scaleWtG']
+                self.StW = [np.array(stw) for stw in calibration_data['sfm_data']['StW']]
+            
+            print(f"校准结果已从 {file_path} 加载")
+            print(f"屏幕尺寸: {calibration_data['device_info']['screen_width']}x{calibration_data['device_info']['screen_height']}")
+            print(f"校准点数: {calibration_data['calibration_parameters']['total_calibration_points']}")
+            print(f"SfM启用: {calibration_data['calibration_parameters']['sfm_enabled']}")
+            
+            return True
             
         except Exception as e:
-            print(f"获取参考屏幕配置失败: {e}，使用默认配置")
-            # 回退到默认配置
-            return PygameCalibrationTargets(
-                width=1920,
-                height=1080,
-                screen_config={'index': 0},
-                reference_screen=None
-            )
+            print(f"加载校准结果失败: {e}")
+            return False
 
-    def _getGazeOnScreen(self, gaze, screen_index=None):
-        """
-        获取注视点在屏幕上的位置，支持多屏幕校准数据切换
-        
-        Args:
-            gaze: 3D注视向量
-            screen_index: 目标屏幕索引，如果为None则使用当前激活的校准数据
-            
-        Returns:
-            FSgaze, Sgaze, Sgaze2: 融合后的注视点坐标
-        """
-        # 如果指定了屏幕索引，切换到对应的校准数据
-        if screen_index is not None and hasattr(self, 'all_screen_calibrations'):
-            screen_calibration = self.get_screen_calibration_data(screen_index)
-            if screen_calibration is not None:
-                # 临时切换到指定屏幕的校准数据
-                original_STransG = self.STransG
-                original_StG = self.StG
-                self.STransG = screen_calibration['STransG']
-                self.StG = screen_calibration['StG']
-                
-                # 同时切换屏幕参数用于坐标转换
-                original_screen_index = self.current_screen_index
-                self.set_current_screen(screen_index)
-                
-                # 使用指定屏幕的校准数据计算注视点
-                result = self._getGazeOnScreen_single(gaze)
-                
-                # 恢复原始校准数据
-                self.STransG = original_STransG
-                self.StG = original_StG
-                self.current_screen_index = original_screen_index
-                self._update_current_screen_parameters()
-                
-                return result
-        
-        # 使用当前校准数据计算注视点
-        return self._getGazeOnScreen_single(gaze)
-    
-    def _getGazeOnScreen_single(self, gaze):
-        """单屏幕注视点计算（原始逻辑）"""
+    def _getGazeOnScreen(self, gaze):
         scaleGaze = self._getScale(gaze, self.STransG)
         Sgaze = (self.STransG @ np.vstack((scaleGaze*gaze[:,None], 1)))[:3]
 
@@ -856,49 +532,7 @@ class HomTransform:
         """
         return FSgaze, Sgaze, Sgaze2
 
-    def _getGazeOnScreen_sfm(self, gaze, WTransG, screen_index=None):
-        """
-        使用SfM获取注视点在屏幕上的位置，支持多屏幕校准数据切换
-        
-        Args:
-            gaze: 3D注视向量
-            WTransG: 世界坐标系变换矩阵
-            screen_index: 目标屏幕索引，如果为None则使用当前激活的校准数据
-            
-        Returns:
-            FSgaze, Sgaze, Sgaze2: 融合后的注视点坐标
-        """
-        # 如果指定了屏幕索引，切换到对应的校准数据
-        if screen_index is not None and hasattr(self, 'all_screen_calibrations'):
-            screen_calibration = self.get_screen_calibration_data(screen_index)
-            if screen_calibration is not None:
-                # 临时切换到指定屏幕的校准数据
-                original_STransW = self.STransW
-                original_scaleWtG = self.scaleWtG
-                original_StW = self.StW
-                original_StG = self.StG
-                
-                self.STransW = screen_calibration['STransW']
-                self.scaleWtG = screen_calibration['scaleWtG']
-                self.StW = screen_calibration['StW']
-                self.StG = screen_calibration['StG']
-                
-                # 使用指定屏幕的校准数据计算注视点
-                result = self._getGazeOnScreen_sfm_single(gaze, WTransG)
-                
-                # 恢复原始校准数据
-                self.STransW = original_STransW
-                self.scaleWtG = original_scaleWtG
-                self.StW = original_StW
-                self.StG = original_StG
-                
-                return result
-        
-        # 使用当前校准数据计算注视点
-        return self._getGazeOnScreen_sfm_single(gaze, WTransG)
-    
-    def _getGazeOnScreen_sfm_single(self, gaze, WTransG):
-        """单屏幕SfM注视点计算（原始逻辑）"""
+    def _getGazeOnScreen_sfm(self, gaze, WTransG):
         WTransG[:3,3] = self.scaleWtG*WTransG[:3,3]
         STransG = self.STransW @ WTransG
         scaleGaze = self._getScale(gaze, STransG)
@@ -1226,60 +860,23 @@ class HomTransform:
 
         return ARotG
 
-    def _update_current_screen_parameters(self):
-        """更新当前屏幕的参数用于坐标转换"""
-        if self.current_screen_index < len(self.screen_configs):
-            current_screen = self.screen_configs[self.current_screen_index]
-            self.current_width = current_screen['width']
-            self.current_height = current_screen['height']
-            self.current_width_mm = current_screen.get('width_mm', self.width_mm)
-            self.current_height_mm = current_screen.get('height_mm', self.height_mm)
-        else:
-            # 使用默认参数（主屏幕）
-            self.current_width = self.width
-            self.current_height = self.height
-            self.current_width_mm = self.width_mm
-            self.current_height_mm = self.height_mm
-    
-    def set_current_screen(self, screen_index):
-        """设置当前使用的屏幕索引"""
-        if 0 <= screen_index < len(self.screen_configs):
-            self.current_screen_index = screen_index
-            self._update_current_screen_parameters()
-            print(f"切换到屏幕 {screen_index + 1}: {self.current_width}x{self.current_height}")
-        else:
-            print(f"警告：屏幕索引 {screen_index} 超出范围，保持当前屏幕")
-    
-    def _mm2pixel(self, vector_mm, screen_index=None):
-        """毫米到像素的转换，支持指定屏幕索引"""
-        # 如果指定了屏幕索引，临时切换到该屏幕
-        original_screen_index = self.current_screen_index
-        original_params = (self.current_width, self.current_height, self.current_width_mm, self.current_height_mm)
-        
-        if screen_index is not None:
-            self.set_current_screen(screen_index)
-        
+    def _mm2pixel(self, vector_mm):
         vector = vector_mm.copy()
         if vector.ndim == 1 and vector.shape[0] == 2:
             # 处理1维2元素向量（x, y）
-            vector[0] = int(vector[0] * self.current_width/self.current_width_mm)
-            vector[1] = int(vector[1] * self.current_height/self.current_height_mm)
+            vector[0] = int(vector[0] * self.width/self.width_mm)
+            vector[1] = int(vector[1] * self.height/self.height_mm)
         elif vector.ndim == 2 and vector.shape[0] == 3:
-            vector[0] = int(vector[0] * self.current_width/self.current_width_mm)
-            vector[1] = int(vector[1] * self.current_height/self.current_height_mm)
+            vector[0] = int(vector[0] * self.width/self.width_mm)
+            vector[1] = int(vector[1] * self.height/self.height_mm)
             vector[2] = int(vector[2])
         elif vector.ndim == 3 and vector.shape[1] == 3:
-            vector[:,0] = (vector[:,0] * self.current_width/self.current_width_mm).astype(int)
-            vector[:,1] = (vector[:,1] * self.current_height/self.current_height_mm).astype(int)
+            vector[:,0] = (vector[:,0] * self.width/self.width_mm).astype(int)
+            vector[:,1] = (vector[:,1] * self.height/self.height_mm).astype(int)
             vector[:,2] = (vector[:,2]).astype(int)
         else:
             raise Exception(f"Vector has wrong shape: {vector.shape}, ndim: {vector.ndim}")
-        
-        # 恢复原始屏幕参数
-        if screen_index is not None:
-            self.current_screen_index = original_screen_index
-            self.current_width, self.current_height, self.current_width_mm, self.current_height_mm = original_params
-        
+
         return vector
 
     def _pixel2mm(self, vector_px):
@@ -1287,11 +884,11 @@ class HomTransform:
             vector_px = np.array(vector_px)
         vector = vector_px.copy()
         if vector.ndim == 1 and vector.shape[0] == 2:
-            vector[0] = vector[0] * self.current_width_mm/self.current_width
-            vector[1] = vector[1] * self.current_height_mm/self.current_height
+            vector[0] = vector[0] * self.width_mm/self.width
+            vector[1] = vector[1] * self.height_mm/self.height
         elif vector.ndim == 2 and vector.shape[1] == 2:
-            vector[:,0] = vector[:,0] * self.current_width_mm/self.current_width
-            vector[:,1] = vector[:,1] * self.current_height_mm/self.current_height
+            vector[:,0] = vector[:,0] * self.width_mm/self.width
+            vector[:,1] = vector[:,1] * self.height_mm/self.height
         else:
             raise Exception("Vector has wrong shape")
 
