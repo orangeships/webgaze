@@ -5,6 +5,9 @@ import time
 import numpy as np
 from collections import deque
 import math
+import ctypes
+import threading
+from pynput import keyboard
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFrame, QMessageBox, QDesktopWidget)
 from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, pyqtSignal, QThread, pyqtSlot, QEasingCurve, QVariantAnimation, QEvent
@@ -236,7 +239,7 @@ class EyeHandInteractionUI:
         
         return load_button, new_button
     
-    def show_interaction_screen(self, interaction_zone=None, current_gaze_point=None):
+    def show_interaction_screen(self, interaction_zone=None, current_gaze_point=None, show_gaze_point_ref=None):
         """显示交互界面（完全透明，只在需要时显示绿色区域）"""
         # 只在需要时创建或更新交互区域
         if interaction_zone or current_gaze_point:
@@ -247,6 +250,7 @@ class EyeHandInteractionUI:
                     self.current_widget.current_gaze_point != current_gaze_point):
                     self.current_widget.interaction_zone = interaction_zone
                     self.current_widget.current_gaze_point = current_gaze_point
+                    self.current_widget.show_gaze_point_ref = show_gaze_point_ref
                     # 强制重绘整个窗口，避免闪烁
                     self.current_widget.repaint()
             else:
@@ -256,7 +260,7 @@ class EyeHandInteractionUI:
                     self.current_widget = None
                 
                 # 创建新的交互区域
-                overlay = InteractionOverlay(interaction_zone, current_gaze_point)
+                overlay = InteractionOverlay(interaction_zone, current_gaze_point, show_gaze_point_ref)
                 overlay.show()
                 self.current_widget = overlay
         else:
@@ -325,11 +329,12 @@ class FadeOutCircle:
 class InteractionOverlay(QWidget):
     """交互区域覆盖层"""
     
-    def __init__(self, interaction_zone, current_gaze_point=None):
+    def __init__(self, interaction_zone, current_gaze_point=None, show_gaze_point_ref=None):
         super().__init__()
         self.interaction_zone = interaction_zone
         self.current_gaze_point = current_gaze_point
         self.fade_circles = []  # 存储所有渐变圆圈
+        self.show_gaze_point_ref = show_gaze_point_ref  # 引用EyeHandInteractionSystem实例的show_gaze_point属性
         self.setup_overlay()
         
     def setup_overlay(self):
@@ -369,8 +374,11 @@ class InteractionOverlay(QWidget):
         # 更新并绘制所有渐变圆圈
         self.update_fade_circles(painter)
         
-        # 实时显示注视点
-        if self.current_gaze_point:
+        # 实时显示注视点（受显示控制变量影响）
+        show_gaze_point = True  # 默认显示
+        if self.show_gaze_point_ref is not None:
+            show_gaze_point = self.show_gaze_point_ref()
+        if self.current_gaze_point and show_gaze_point:
             gaze_x, gaze_y = self.current_gaze_point
             # 外圈（白色边框）
             painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
@@ -385,7 +393,7 @@ class InteractionOverlay(QWidget):
         # 绘制绿色圆圈交互区域
         if self.interaction_zone:
             x, y = self.interaction_zone
-            radius = 95
+            radius = 100  # 与传送距离保持一致
             
             # 绘制实心圆圈（减少闪烁）
             painter.setBrush(QBrush(QColor(50, 205, 50, 60)))  # 半透明填充
@@ -439,120 +447,7 @@ class InteractionOverlay(QWidget):
     
 
 
-class GazeDispersionAnalyzer:
-    """注视点离散度分析器 - 与原始代码相同"""
-    
-    def __init__(self, time_window_ms=500, angle_threshold=3.0, pixel_threshold=100):
-        self.time_window_ms = time_window_ms
-        self.angle_threshold = angle_threshold
-        self.pixel_threshold = pixel_threshold
-        self.gaze_points = deque()  # 存储 (timestamp, x, y) 元组
-        self.last_trigger_time = 0
-        self.trigger_cooldown = 1000  # 触发冷却时间1000ms
-    
-    def add_gaze_point(self, x, y):
-        """添加新的注视点"""
-        current_time = time.time() * 1000  # 转换为毫秒
-        self.gaze_points.append((current_time, x, y))
-        
-        # 移除超过时间窗口的点
-        while self.gaze_points and (current_time - self.gaze_points[0][0] > self.time_window_ms):
-            self.gaze_points.popleft()
-    
-    def calculate_dispersion(self):
-        """计算当前时间窗口内注视点的离散度 - 使用中位数中心 + IQR方法"""
-        if len(self.gaze_points) < 2:
-            return {
-                'angle_dispersion': 0,
-                'pixel_dispersion': 0,
-                'point_count': len(self.gaze_points),
-                'geometric_center': None,
-                'method_used': 'median_iqr'
-            }
-        
-        # 提取坐标并转换为numpy数组
-        points = np.array([(x, y) for _, x, y in self.gaze_points])
-        
-        # 使用中位数计算中心点（对离群值不敏感）
-        center_x = np.median(points[:, 0])
-        center_y = np.median(points[:, 1])
-        geometric_center = (float(center_x), float(center_y))
-        
-        # 计算各点到中位数中心的距离
-        pixel_distances = np.sqrt((points[:, 0] - center_x)**2 + (points[:, 1] - center_y)**2)
-        
-        # 使用四分位距(IQR)代替标准差 - 更鲁棒的离散度度量
-        q75, q25 = np.percentile(pixel_distances, [75, 25])
-        iqr = q75 - q25
-        
-        # IQR本身就是一种变异程度的度量，我们直接使用它作为离散度指标
-        pixel_dispersion = float(iqr)
-        
-        # 计算角度离散度（相对于屏幕中心的角度变化）
-        if hasattr(self, 'screen_width') and hasattr(self, 'screen_height'):
-            screen_center_x = self.screen_width / 2
-            screen_center_y = self.screen_height / 2
-            
-            # 计算每个点相对于屏幕中心的角度
-            angles = []
-            for x, y in points:
-                dx = x - screen_center_x
-                dy = y - screen_center_y
-                angle = math.degrees(math.atan2(dy, dx))
-                angles.append(angle)
-            
-            # 计算角度离散度 - 使用IQR方法
-            if angles:
-                angles_array = np.array(angles)
-                # 使用角度的四分位距
-                angle_q75, angle_q25 = np.percentile(angles_array, [75, 25])
-                angle_iqr = angle_q75 - angle_q25
-                angle_dispersion = min(float(angle_iqr), 180)  # 限制在180度内
-            else:
-                angle_dispersion = 0
-        else:
-            # 如果没有屏幕尺寸信息，使用像素离散度估算角度离散度
-            # 假设屏幕对角线长度，转换为近似角度
-            screen_diagonal_pixels = 1920  # 假设
-            angle_dispersion = (pixel_dispersion / screen_diagonal_pixels) * 180
-        
-        return {
-            'angle_dispersion': angle_dispersion,
-            'pixel_dispersion': pixel_dispersion,
-            'point_count': len(self.gaze_points),
-            'geometric_center': geometric_center,
-            'method_used': 'median_iqr',  # 标记使用的算法
-            'iqr_info': {  # 额外的调试信息
-                'q25': float(q25),
-                'q75': float(q75),
-                'iqr': pixel_dispersion
-            }
-        }
-    
-    def check_trigger_conditions(self):
-        """检查是否满足触发条件"""
-        dispersion_info = self.calculate_dispersion()
-        
-        current_time = time.time() * 1000
-        
-        # 检查是否在冷却期内
-        if current_time - self.last_trigger_time < self.trigger_cooldown:
-            return False, None
-        
-        # 检查触发条件
-        angle_triggered = dispersion_info['angle_dispersion'] < self.angle_threshold
-        pixel_triggered = dispersion_info['pixel_dispersion'] < self.pixel_threshold
-        
-        if angle_triggered or pixel_triggered:
-            self.last_trigger_time = current_time
-            return True, dispersion_info['geometric_center']
-        
-        return False, None
-    
-    def set_screen_dimensions(self, width, height):
-        """设置屏幕尺寸用于角度计算"""
-        self.screen_width = width
-        self.screen_height = height
+
 
 class EyeHandInteractionSystem:
     def __init__(self, project_dir):
@@ -562,20 +457,13 @@ class EyeHandInteractionSystem:
         self.homtrans = None
         self.cap = None
         self.calibration_data = None
-        self.kalman_filter = KalmanFilter(process_noise=0.005, measurement_noise=5.0, error_estimate=2.0)
-        self.kalman_enabled = False
         
-        # 初始化注视点分析器
-        self.dispersion_analyzer = GazeDispersionAnalyzer(
-            time_window_ms=500, 
-            angle_threshold=3.0, 
-            pixel_threshold=100
-        )
+
         
         # 当前交互状态
         self.current_interaction_zone = None
         self.previous_interaction_zone = None
-        self.interaction_zone_duration = 2000  # 交互区域显示持续时间2000ms
+        self.interaction_zone_duration = 1000  # 交互区域显示持续时间1000ms
         self.interaction_zone_start_time = 0
         
         # 手眼协调机制相关状态变量
@@ -588,54 +476,60 @@ class EyeHandInteractionSystem:
         self.sliding_window_angle_threshold = 3.0  # 角度分布阈值 4°
         self.sliding_window_time_limit = 350  # 滑动窗口时间限制 350ms
         
-        # 鼠标自动移动相关
-        self.last_auto_mouse_move_time = 0  # 上次自动鼠标移动的时间
-        self.auto_mouse_move_cooldown = 1000  # 自动移动冷却时间 1000ms
-        self.auto_mouse_move_threshold = None  # 自动移动触发距离阈值（像素），将在初始化时设置
-        
         # 鼠标滑动窗口检测相关
-        self.mouse_movement_window = deque(maxlen=8)  # 鼠标滑动窗口，最多8个位置点
-        self.mouse_movement_threshold = 30  # 鼠标移动触发阈值（像素）
+        self.mouse_movement_window = deque(maxlen=5)  # 鼠标滑动窗口，最多5个位置点
+        self.mouse_movement_threshold = 200  # 鼠标移动触发阈值（像素）
         self.initial_mouse_position = None  # 鼠标初始位置
         self.teleport_circle_radius = 100  # 传送圆周半径（像素）
         
-        # 注视点平滑相
-        self.gaze_history = deque(maxlen=6)  # 最近6个注视点用于平滑
+        # 传送冷却机制相关
+        self.last_teleport_trigger_time = 0  # 上次传送触发时间
+        self.teleport_cooldown_duration = 1000  # 传送冷却时间1000ms（1秒）
+        
+        # 轻量级卡尔曼滤波器初始化（替换自适应移动平均算法）
+        self.kalman_filter = LightweightKalmanFilter(
+            process_noise=0.6,     # 过程噪声，进一步提高响应速度
+            measurement_noise=0.2, # 测量噪声，更信任新测量值，平滑更轻微
+            error_estimate=50.0    # 初始误差估计，最大化初始不确定性
+        )
         self.smoothing_enabled = True  # 平滑开关
-        self.smoothing_threshold = 30  # 自适应平滑阈值（像素）
         
         # 传送完成标记相关
         self.first_teleport_completed = False  # 标记第一次传送是否完成
         self.teleport_info = None  # 存储第一次传送的信息
         
+        # 注视点显示控制相关
+        self.show_gaze_point = True  # 是否显示注视点（红色点）
+        
+        # 传送后速度阻尼相关变量
+        self.last_teleport_time = 0  # 上次传送的时间戳
+        self.post_teleport_damping_enabled = True  # 传送后阻尼开关
+        self.post_teleport_duration = 1000  # 阻尼持续时间（毫秒）
+        self.damping_factor = 0.01  # 阻尼系数：0.01表示速度降低到1%
+        
+        # 系统级鼠标速度控制（集成test.py方法）
+        self.user32 = ctypes.windll.user32
+        self.SPI_SETMOUSESPEED = 0x0071
+        self.SPI_GETMOUSESPEED = 0x0070
+        self.SPIF_SENDCHANGE = 0x0002
+        
+        self.TARGET_LOW_SPEED = 2  # 目标低速度
+        self.RESTORE_TARGET_SPEED = 10  # 恢复目标速度
+        self.RESTORE_TIME = 1.2  # 恢复时间（秒）
+        self.RESTORE_STEP_DELAY = 0.01  # 恢复步长延迟
+        self.EASING_POWER = 3  # 非线性缓出指数
+        
+        self.restoring = False  # 恢复状态标记
+        self.original_mouse_speed = self.get_mouse_speed()  # 记录原始鼠标速度
+        
         # 初始化时设置快速移动距离阈值
-        self._initialize_hand_eye_coordination()
     
-    def _initialize_hand_eye_coordination(self):
-        """初始化手眼协调机制"""
-        # 设置鼠标自动移动触发距离阈值为屏幕对角线的1/4
-        if self.ui:
-            screen_width = self.ui.screen_width
-            screen_height = self.ui.screen_height
-        else:
-            # 如果UI尚未初始化，使用默认屏幕尺寸
-            screen = QApplication.primaryScreen()
-            screen_geometry = screen.geometry()
-            screen_width = screen_geometry.width()
-            screen_height = screen_geometry.height()
-        
-        # 计算屏幕对角线的1/4作为鼠标移动触发阈值
-        screen_diagonal = np.sqrt(screen_width**2 + screen_height**2)
-        self.auto_mouse_move_threshold = screen_diagonal / 4
-        
         
     def initialize(self):
         """初始化系统"""
         # 初始化UI
         self.ui = EyeHandInteractionUI()
         self.ui.initialize_display()
-        # 设置屏幕尺寸用于角度计算
-        self.dispersion_analyzer.set_screen_dimensions(self.ui.screen_width, self.ui.screen_height)
         
         # 初始化模型
         self.model = EyeModel(self.project_dir)
@@ -762,12 +656,15 @@ class EyeHandInteractionSystem:
         # 主循环标志
         self.running = True
         
-        # 导入keyboard库用于ESC键检测
+        # 导入keyboard库用于ESC键和空格键检测
         try:
             import keyboard
         except ImportError:
             print("Warning: keyboard library not found. ESC exit may not work properly.")
             keyboard = None
+        
+        # 用于防止空格键重复触发的状态变量
+        self.space_key_was_pressed = False
         
         while self.running:
             ret, frame = self.cap.read()
@@ -779,6 +676,24 @@ class EyeHandInteractionSystem:
                 print("检测到ESC键，程序将退出...")
                 self.running = False
                 break
+            
+            # 检查空格键切换注视点显示状态（防抖处理）
+            if keyboard:
+                space_key_pressed = keyboard.is_pressed('space')
+                if space_key_pressed and not self.space_key_was_pressed:
+                    # 空格键刚被按下，切换注视点显示状态
+                    self.show_gaze_point = not self.show_gaze_point
+                    status = "显示" if self.show_gaze_point else "隐藏"
+                    print(f"切换注视点显示状态：{status}")
+                    
+                    # 强制重绘界面以立即显示变化
+                    if self.ui.current_widget:
+                        self.ui.current_widget.repaint()
+                    
+                    self.space_key_was_pressed = True
+                elif not space_key_pressed:
+                    # 空格键被释放，允许下次按下时触发
+                    self.space_key_was_pressed = False
             
             # 检测人脸和眼动
             try:
@@ -841,10 +756,10 @@ class EyeHandInteractionSystem:
                         gaze_x = self.ui.screen_width // 2
                         gaze_y = self.ui.screen_height // 2
                     
-                    # 应用高效的平滑算法（替代卡尔曼滤波）
+                    # 应用轻量级卡尔曼滤波平滑算法
                     raw_gaze_point = (gaze_x, gaze_y)
                     
-                    # 使用自适应平滑算法
+                    # 使用轻量级卡尔曼滤波算法进行平滑处理
                     if self.smoothing_enabled:
                         gaze_point = self._smooth_gaze_point(raw_gaze_point)
                     else:
@@ -864,25 +779,17 @@ class EyeHandInteractionSystem:
                     
                     # 更新前一注视点
                     previous_gaze_point = current_gaze_point
-                    
-                    # 添加到注视点分析器
-                    self.dispersion_analyzer.add_gaze_point(gaze_point[0], gaze_point[1])
-                    
-                    # 检查触发条件
-                    triggered, center_point = self.dispersion_analyzer.check_trigger_conditions()
                         
                 except Exception:
                     pass
             
-            # 获取离散度信息
-            dispersion_info = self.dispersion_analyzer.calculate_dispersion()
-            
             # 更新交互界面（同时显示注视点和交互区域）
             if self.current_interaction_zone or self.previous_interaction_zone or current_gaze_point:
-                # 显示交互界面
+                # 显示交互界面，传递show_gaze_point属性的引用
                 self.ui.show_interaction_screen(
                     interaction_zone=self.current_interaction_zone,
-                    current_gaze_point=current_gaze_point
+                    current_gaze_point=current_gaze_point,
+                    show_gaze_point_ref=lambda: self.show_gaze_point
                 )
             self.previous_interaction_zone = self.current_interaction_zone
             
@@ -906,88 +813,164 @@ class EyeHandInteractionSystem:
         
         current_time = time.time() * 1000  # 转换为毫秒
         
-        # 持续收集注视点到滑动窗口
+        # 持续收集注视点到滑动窗口（自动维护最多8个点）
         self.sliding_window_gaze_points.append((current_time, gaze_point[0], gaze_point[1]))
    
         # 当滑动窗口收集满8个点时进行检查
         if len(self.sliding_window_gaze_points) >= 8:
-        
             self._check_sliding_window_distribution()
-            # 检查完成后清空窗口，准备下一轮检测
-            self.sliding_window_gaze_points.clear()
+            # 检查完成后不清空，让滑动窗口继续工作（移除最老点，加入新点）
         
-    
     def _check_sliding_window_distribution(self):
-        """检查滑动窗口内的视线分布是否符合条件（基于像素距离）"""
-        if len(self.sliding_window_gaze_points) < 8:
-           return
-        
-       
-        
-        # 提取坐标点（只取坐标，不取时间戳）
-        points = [(x, y) for _, x, y in self.sliding_window_gaze_points]
-        
-        # 计算几何中心
-        center_x = sum(p[0] for p in points) / len(points)
-        center_y = sum(p[1] for p in points) / len(points)
-        
-        # 计算所有点到中心的距离
-        distances = [np.sqrt((p[0] - center_x)**2 + (p[1] - center_y)**2) for p in points]
-        
-        # 计算最大距离作为分布范围（代替角度分布）
-        max_distance = max(distances) if distances else 0
-        avg_distance = np.mean(distances) if distances else 0
-        
-        # 检查是否满足视线稳定性条件（最大距离<150像素，平均距离<75像素）
-        pixel_threshold = 150  # 最大分布距离阈值
-        avg_pixel_threshold = 75  # 平均分布距离阈值
-        
-        if max_distance < pixel_threshold and avg_distance < avg_pixel_threshold:
-            # 第一个条件满足：注视点分布稳定
-           # 第二个条件：检查鼠标移动条件并触发光标跳转
-            self._check_mouse_movement_and_trigger_cursor(center_x, center_y)
-        else:
-            if max_distance >= pixel_threshold:
-                print(f"    - 最大距离超限: {max_distance:.2f} >= {pixel_threshold}")
-            if avg_distance >= avg_pixel_threshold:
-                print(f"    - 平均距离超限: {avg_distance:.2f} >= {avg_pixel_threshold}")
+        """更稳健的滑动窗口视线稳定性判断"""
+        points = np.array([(x, y) for _, x, y in self.sliding_window_gaze_points])
+        # ===== 1) 使用中位数作为中心（比均值稳健得多） =====
+        center = np.median(points, axis=0)
+
+        # ===== 2) 使用绝对偏差( MAD )代替 max_distance / avg_distance =====
+        # MAD 是鲁棒统计中特别常用的“抗噪”指标
+        distances = np.sqrt(np.sum((points - center)**2, axis=1))
+        mad = np.median(np.abs(distances - np.median(distances)))
+
+        # ===== 3) 判断分布范围（比你现在的 max/avg 更稳定）=====
+        # 推荐阈值（你可调）：
+        mad_threshold = 50         # 稳定凝视：散布在半径约 50 px 范围内
+        perc95_threshold = 120     # 绝大部分点不要过分发散
+
+        perc95 = np.percentile(distances, 95)
+
+        stable_spatial = (mad < mad_threshold) and (perc95 < perc95_threshold)
+
+        # ===== 4) 加入时间稳定性：至少 300ms 都稳定 =====
+        timestamps = [t for t, _, _ in self.sliding_window_gaze_points]
+        duration = timestamps[-1] - timestamps[0]
+        stable_time = duration > 0.3   # 300 ms 以上才算真正凝视
+
+    # ======= 最终判定 =======
+        if stable_spatial and stable_time:
+            self._check_mouse_movement_and_trigger_cursor(center[0], center[1])
+
     
     def _check_mouse_movement_and_trigger_cursor(self, target_x, target_y):
-        """检查鼠标移动条件并触发光标跳转（三个触发条件）"""
+        """检查鼠标移动条件并触发光标跳转（改进的方向判断方法）
+        
+        注意：此方法只进行逻辑判断和传送触发，实际的鼠标位置控制由_auto_move_mouse_to_gaze处理
+        避免应用级阻尼与系统级速度控制产生冲突，确保传送后效果平滑
+        """
         try:
             # 获取当前鼠标位置
             current_cursor_pos = win32api.GetCursorPos()
             cursor_x, cursor_y = current_cursor_pos
-            current_time = time.time() * 1000  # 转换为毫秒
+            
+            # 获取当前时间戳（毫秒）
+            current_time = time.time() * 1000
             
             # 计算当前鼠标与注视点的距离（第三个判定条件）
             gaze_cursor_distance = np.sqrt((cursor_x - target_x)**2 + (cursor_y - target_y)**2)
             
             # 记录当前鼠标位置到滑动窗口
             self.mouse_movement_window.append((current_time, cursor_x, cursor_y))
-           
-            # 如果是第一次记录，设置初始位置
-            if self.initial_mouse_position is None:
-                self.initial_mouse_position = (cursor_x, cursor_y)
             
-            # 检查鼠标是否从初始位置持续移动了15像素
+            # 使用滑动窗口第一个和最后一个位置计算移动距离和方向
             if len(self.mouse_movement_window) >= 2:
-                # 计算当前鼠标位置与初始位置的距离和方向
-                initial_x, initial_y = self.initial_mouse_position
-                move_dx = cursor_x - initial_x  # 鼠标移动的X分量
-                move_dy = cursor_y - initial_y  # 鼠标移动的Y分量
+                # 使用滑动窗口第一个和最后一个位置计算移动距离和方向
+                first_pos = self.mouse_movement_window[0]  # 第一个位置 (timestamp, x, y)
+                last_pos = self.mouse_movement_window[-1]   # 最后一个位置 (timestamp, x, y)
+                move_dx = last_pos[1] - first_pos[1]  # x坐标差值
+                move_dy = last_pos[2] - first_pos[2]  # y坐标差值
                 mouse_move_distance = np.sqrt(move_dx**2 + move_dy**2)
                 
-                # 第三个条件：当前鼠标与注视点距离必须大于400像素
-                if mouse_move_distance >= self.mouse_movement_threshold and gaze_cursor_distance > 400:
-                    # 所有三个条件都满足：鼠标移动条件满足，传送到渐变圆圈位置（注视点）
-                    # 执行渐变圆圈传送
-                    print(f"[DEBUG] ✅ 三个条件都满足：鼠标移动{mouse_move_distance:.2f}px, 注视点距离{gaze_cursor_distance:.2f}px")
-                    self._trigger_fade_circle_cursor_move_and_reset(target_x, target_y)
+                # === 改进的方向判断方法 ===
+                # 方法1: 余弦相似度（更直接的相似度判断）
+                cosine_similarity = self._calculate_cosine_similarity_to_gaze(
+                    move_dx, move_dy, cursor_x, cursor_y, target_x, target_y)
+                
+                # 距离变化方法（直接检查距离是否在减少）
+                distance_change = self._calculate_distance_change(
+                    first_pos[1], first_pos[2], cursor_x, cursor_y, target_x, target_y)
+                
+                # 综合判断：使用余弦相似度和距离变化的组合
+                direction_valid = self._combined_direction_check(
+                    cosine_similarity, distance_change, mouse_move_distance)
+                
+                # 检查是否达到所有触发条件：保持300像素最小距离要求
+                if (mouse_move_distance >= self.mouse_movement_threshold and 
+                    gaze_cursor_distance > 300 and  # 保持300像素最小距离要求
+                    direction_valid):
+                    
+                    # 检查传送冷却时间
+                    current_time = time.time() * 1000  # 毫秒时间戳
+                    time_since_last_teleport = current_time - self.last_teleport_trigger_time
+                    
+                    if time_since_last_teleport >= self.teleport_cooldown_duration:
+                        # 所有条件都满足且不在冷却期：执行传送
+                        print(f"[INFO] 鼠标传送触发: 移动{mouse_move_distance:.0f}px, 距离{gaze_cursor_distance:.0f}px")
+                        print(f"[DEBUG] 方向判断 - 余弦相似度: {cosine_similarity:.3f}, 距离变化: {distance_change:.1f}")
+                        self.last_teleport_trigger_time = current_time  # 更新上次传送时间
+                        self._trigger_fade_circle_cursor_move_and_reset(target_x, target_y)
+            else:
+                # 如果是第一次记录，不需要设置初始位置，滑动窗口会自动维护
+                pass
                     
         except Exception as e:
             print(f"[DEBUG] 鼠标移动检测异常: {e}")
             pass
+    
+    def _calculate_cosine_similarity_to_gaze(self, move_dx, move_dy, cursor_x, cursor_y, target_x, target_y):
+        """计算鼠标移动方向与指向注视点方向的余弦相似度"""
+        # 鼠标移动向量
+        move_vector = np.array([move_dx, move_dy])
+        move_magnitude = np.linalg.norm(move_vector)
+        
+        if move_magnitude < 1e-6:  # 移动距离太小
+            return 0.0
+        
+        # 指向注视点的向量
+        gaze_vector = np.array([target_x - cursor_x, target_y - cursor_y])
+        gaze_magnitude = np.linalg.norm(gaze_vector)
+        
+        if gaze_magnitude < 1e-6:  # 距离太近
+            return 0.0
+        
+        # 计算余弦相似度
+        cosine_similarity = np.dot(move_vector, gaze_vector) / (move_magnitude * gaze_magnitude)
+        # 限制在[-1, 1]范围内
+        cosine_similarity = np.clip(cosine_similarity, -1.0, 1.0)
+        
+        return cosine_similarity
+    
+    def _calculate_distance_change(self, first_x, first_y, current_x, current_y, target_x, target_y):
+        """计算鼠标与注视点距离的变化（减少为正数）"""
+        # 初始距离
+        initial_distance = np.sqrt((first_x - target_x)**2 + (first_y - target_y)**2)
+        # 当前距离
+        current_distance = np.sqrt((current_x - target_x)**2 + (current_y - target_y)**2)
+        
+        # 距离变化：正数表示接近，负数表示远离
+        distance_change = initial_distance - current_distance
+        
+        return distance_change
+    
+    def _combined_direction_check(self, cosine_similarity, distance_change, move_distance):
+        """优化的方向判断：降低阈值减少延迟"""
+        # 余弦相似度阈值：>0.3表示朝注视点方向移动（降低阈值）
+        cosine_threshold = 0.4
+        cosine_valid = cosine_similarity > cosine_threshold
+        
+        # 距离变化阈值：>20像素表示确实在接近（降低阈值）
+        distance_threshold = 40.0
+        distance_valid = distance_change > distance_threshold
+        
+        # 移动距离验证（避免微小抖动）
+        min_move_threshold = 15.0
+        move_valid = move_distance > min_move_threshold
+        
+        # 只有在有足够移动距离的情况下，才进行方向判断
+        if not move_valid:
+            return False
+        
+        # 两个条件都满足时才触发传送
+        return cosine_valid and distance_valid
     
     def _calculate_circular_teleport(self, center_x, center_y, move_dx, move_dy):
         """根据鼠标移动方向计算圆周传送目标点"""
@@ -1009,47 +992,55 @@ class EyeHandInteractionSystem:
     def _trigger_fade_circle_cursor_move_and_reset(self, fade_circle_x, fade_circle_y):
         """触发传送到渐变圆圈边界的光标移动并重置所有相关状态"""
         try:
+            # 保存传送前的鼠标滑动窗口数据，防止传送后窗口数据被污染
+            saved_window = list(self.mouse_movement_window)
+            
             # 获取当前鼠标位置作为参考点
             current_cursor_pos = win32api.GetCursorPos()
             cursor_x, cursor_y = current_cursor_pos
             
-            # 计算传送目标：渐变圆圈的边界位置（使用鼠标移动方向）
+            # 使用滑动窗口第一个和最后一个位置计算移动方向和距离
             if len(self.mouse_movement_window) >= 2:
-                # 使用滑动窗口计算移动方向
-                initial_pos = self.mouse_movement_window[0]
-                current_pos = self.mouse_movement_window[-1]
-                move_dx = current_pos[1] - initial_pos[1]  # x坐标
-                move_dy = current_pos[2] - initial_pos[2]  # y坐标
-                 
-            elif self.initial_mouse_position is not None:
-                # 使用初始位置和当前鼠标位置计算方向
-                move_dx = cursor_x - self.initial_mouse_position[0]
-                move_dy = cursor_y - self.initial_mouse_position[1]
+                # 使用滑动窗口第一个和最后一个位置
+                first_pos = self.mouse_movement_window[0]  # (timestamp, x, y)
+                last_pos = self.mouse_movement_window[-1]   # (timestamp, x, y)
+                move_dx = last_pos[1] - first_pos[1]  # x坐标差值
+                move_dy = last_pos[2] - first_pos[2]  # y坐标差值
+                move_distance = np.sqrt(move_dx**2 + move_dy**2)  # 滑动窗口总移动距离
                 
+                # 滑动窗口移动信息，仅在需要时输出
+                
+                # 使用滑动窗口移动方向计算传送目标
+                if move_distance > 1e-6:
+                    # 归一化方向向量
+                    normalized_dx = move_dx / move_distance
+                    normalized_dy = move_dy / move_distance
+                    
+                    # 传送到渐变圆圈的边界上（对侧方向）
+                    target_x = fade_circle_x - normalized_dx * self.teleport_circle_radius
+                    target_y = fade_circle_y - normalized_dy * self.teleport_circle_radius
+                else:
+                    # 如果移动距离太小，使用固定偏移
+                    target_x = fade_circle_x - self.teleport_circle_radius
+                    target_y = fade_circle_y
             else:
-                # 使用当前鼠标位置与渐变圆圈中心计算方向
+                # 如果滑动窗口数据不足，使用当前鼠标位置与渐变圆圈中心计算方向
                 move_dx = cursor_x - fade_circle_x
                 move_dy = cursor_y - fade_circle_y
-              
-              # 归一化移动方向并映射到渐变圆圈边界
-            move_magnitude = np.sqrt(move_dx**2 + move_dy**2)
-            if move_magnitude > 1e-6:
-                # 归一化方向向量
-                normalized_dx = move_dx / move_magnitude
-                normalized_dy = move_dy / move_magnitude
+                move_magnitude = np.sqrt(move_dx**2 + move_dy**2)
                 
-                # 传送到渐变圆圈的边界上（对侧方向）
-                target_x = fade_circle_x - normalized_dx * 100  # 渐变圆圈半径100px
-                target_y = fade_circle_y - normalized_dy * 100
-                
-            else:
-                # 如果移动距离太小，使用固定偏移
-                target_x = fade_circle_x + 100
-                target_y = fade_circle_y
+                if move_magnitude > 1e-6:
+                    normalized_dx = move_dx / move_magnitude
+                    normalized_dy = move_dy / move_magnitude
+                    target_x = fade_circle_x - normalized_dx * self.teleport_circle_radius
+                    target_y = fade_circle_y - normalized_dy * self.teleport_circle_radius
+                else:
+                    target_x = fade_circle_x - self.teleport_circle_radius
+                    target_y = fade_circle_y
             
             # 在传送前，在注视点中心位置显示绿色圆圈（作为视觉反馈）
             if self.ui and self.ui.current_widget and isinstance(self.ui.current_widget, InteractionOverlay):
-                self.ui.current_widget.add_fade_circle(fade_circle_x, fade_circle_y, radius=95, duration=1500)
+                self.ui.current_widget.add_fade_circle(fade_circle_x, fade_circle_y, radius=self.teleport_circle_radius, duration=1500)
             
             # 如果是第一次传送，存储信息并设置标记
             if not self.first_teleport_completed:
@@ -1060,9 +1051,6 @@ class EyeHandInteractionSystem:
                     'teleport_x': target_x,
                     'teleport_y': target_y
                 }
-                
-                # 执行光标传送到渐变圆圈边界
-                self._auto_move_mouse_to_gaze(target_x, target_y)
                 
                 # 等待一小段时间让传送完成
                 time.sleep(0.1)
@@ -1075,98 +1063,158 @@ class EyeHandInteractionSystem:
                     y_diff = final_cursor_pos[1] - cursor_y
                 except Exception as e:
                     pass
-                
-                # 重置鼠标滑动窗口状态
-                self.mouse_movement_window.clear()
-                self.initial_mouse_position = None
-                
-          
             
             # 执行光标传送到渐变圆圈边界
             self._auto_move_mouse_to_gaze(target_x, target_y)
             
-            # 重置鼠标滑动窗口状态
+            # 传送后重置鼠标滑动窗口，确保下次传送基于正确的鼠标移动数据
             self.mouse_movement_window.clear()
-            self.initial_mouse_position = None
+            # 添加传送后的鼠标位置作为新起点
+            final_pos = win32api.GetCursorPos()
+            current_time = time.time() * 1000
+            self.mouse_movement_window.append((current_time, final_pos[0], final_pos[1]))
             
         except Exception as e:
+            print(f"[DEBUG] 传送执行异常: {e}")
             pass
     
-    def _trigger_circular_cursor_move_and_reset(self, teleport_x, teleport_y):
-        """触发圆周光标传送并重置所有相关状态"""
-        try:
-            # 执行光标传送
-            self._auto_move_mouse_to_gaze(teleport_x, teleport_y)
-            
-            # 重置鼠标滑动窗口状态
-            self.mouse_movement_window.clear()
-            self.initial_mouse_position = None
-            
-        except Exception as e:
-            pass
-    
-    def _trigger_cursor_move_and_reset(self, target_x, target_y):
-        """触发光标移动并重置所有相关状态"""
-        try:
-            # 移动鼠标到视线中心点
-            self._auto_move_mouse_to_gaze(target_x, target_y)
-            
-            # 重置鼠标滑动窗口状态
-            self.mouse_movement_window.clear()
-            self.initial_mouse_position = None
-            
-        except Exception as e:
-            pass
+
     
     def _smooth_gaze_point(self, raw_gaze_point):
-        """高效的注视点平滑算法（替代卡尔曼滤波）
+        """轻量级卡尔曼滤波注视点平滑算法
         
-        使用自适应移动平均，根据注视点稳定性动态调整平滑强度
+        使用轻量级卡尔曼滤波器实现轻微平滑效果，避免过度滤波导致响应延迟
+        通过优化的参数设置避免过冲现象
+        
+        Args:
+            raw_gaze_point: 原始注视点坐标 (x, y)
+            
+        Returns:
+            平滑后的注视点坐标 (x, y)
         """
         if not self.smoothing_enabled or not raw_gaze_point:
             return raw_gaze_point
         
-        # 添加原始注视点到历史记录
-        self.gaze_history.append(raw_gaze_point)
+        # 确保raw_gaze_point是numpy数组格式
+        measurement = np.array(raw_gaze_point, dtype=np.float32)
         
-        if len(self.gaze_history) < 2:
-            return raw_gaze_point
+        # 使用卡尔曼滤波器更新状态
+        filtered_state = self.kalman_filter.update(measurement)
         
-        # 计算历史点的离散度（使用最近3个点）
-        recent_points = list(self.gaze_history)[-3:]
-        center_x = sum(p[0] for p in recent_points) / len(recent_points)
-        center_y = sum(p[1] for p in recent_points) / len(recent_points)
+        # 获取滤波后的位置
+        smoothed_position = self.kalman_filter.get_position()
         
-        # 计算平均偏移距离
-        avg_offset = sum(np.sqrt((p[0] - center_x)**2 + (p[1] - center_y)**2) for p in recent_points) / len(recent_points)
-        
-        # 自适应平滑权重：注视点越稳定，平滑强度越大
-        if avg_offset < 10:  # 非常稳定
-            smoothing_weight = 0.8  # 强平滑
-        elif avg_offset < 20:  # 较稳定
-            smoothing_weight = 0.6  # 中等平滑
-        elif avg_offset < self.smoothing_threshold:  # 一般稳定
-            smoothing_weight = 0.4  # 轻度平滑
-        else:  # 不稳定
-            smoothing_weight = 0.2  # 弱平滑，保持响应性
-        
-        # 计算加权平均值（移动平均 + 当前点加权）
-        history_weight = smoothing_weight
-        current_weight = 1.0 - history_weight
-        
-        # 使用所有历史点进行加权平均
-        smoothed_x = sum(p[0] for p in self.gaze_history) / len(self.gaze_history) * history_weight + raw_gaze_point[0] * current_weight
-        smoothed_y = sum(p[1] for p in self.gaze_history) / len(self.gaze_history) * history_weight + raw_gaze_point[1] * current_weight
-        
-        smoothed_point = (smoothed_x, smoothed_y)
+        # 返回平滑后的位置（优化的轻微平滑效果，无过冲）
+        smoothed_point = (float(smoothed_position[0]), float(smoothed_position[1]))
         
         return smoothed_point
     
+    def _check_gaze_dwell_state(self):
+        """检查dwell状态：检测注视点稳定性（用于右键触发前的稳定性检查）
+        
+        Returns:
+            bool: 如果dwell检测开启且最近5帧注视点分布不超过200像素阈值，返回True
+        """
+        if not self.dwell_enabled:
+            return True  # 如果dwell检测关闭，总是返回True
+        
+        # 获取最近5帧注视点（如果没有足够的历史记录，也返回True）
+        if len(self.dwell_gaze_history) < 5:
+            return True
+        
+        # 计算注视点分布范围：最大距离差
+        min_x = min(gaze[0] for gaze in self.dwell_gaze_history)
+        max_x = max(gaze[0] for gaze in self.dwell_gaze_history)
+        min_y = min(gaze[1] for gaze in self.dwell_gaze_history)
+        max_y = max(gaze[1] for gaze in self.dwell_gaze_history)
+        
+        # 计算水平和垂直方向的最大变化距离
+        max_distance = max(max_x - min_x, max_y - min_y)
+        
+        # 如果最大变化距离不超过阈值，认为注视状态稳定
+        return max_distance <= self.dwell_threshold
+    
+    def _calculate_damping_factor(self, current_time):
+        """计算当前阻尼系数（简化的指数阻尼）
+        
+        Args:
+            current_time: 当前时间戳（毫秒）
+            
+        Returns:
+            float: 阻尼系数（0.0-1.0）
+        """
+        if not self.post_teleport_damping_enabled:
+            return 1.0
+        
+        # 检查是否在传送后阻尼期间
+        time_since_teleport = current_time - self.last_teleport_time
+        if time_since_teleport > self.post_teleport_duration or self.last_teleport_time == 0:
+            return 1.0
+        
+        # 计算阻尼期间的进度（0.0-1.0）
+        progress = time_since_teleport / self.post_teleport_duration
+        
+        # 使用指数阻尼：快速衰减然后逐渐平缓
+        factor = self.damping_factor + (1.0 - self.damping_factor) * np.exp(-4 * progress)
+        
+        return max(self.damping_factor, min(1.0, factor))
+
+    def set_mouse_speed(self, speed):
+        """设置鼠标速度（使用Windows API）"""
+        speed = int(max(1, min(20, speed)))
+        self.user32.SystemParametersInfoW(self.SPI_SETMOUSESPEED, 0, speed, self.SPIF_SENDCHANGE)
+
+    def get_mouse_speed(self):
+        """获取当前鼠标速度"""
+        v = ctypes.c_int()
+        self.user32.SystemParametersInfoW(self.SPI_GETMOUSESPEED, 0, ctypes.byref(v), 0)
+        return v.value
+
+    def restore_speed_ease_out(self, start_speed):
+        """非线性缓出式恢复鼠标速度"""
+        self.restoring = True
+        steps = int(self.RESTORE_TIME / self.RESTORE_STEP_DELAY)
+        
+        for i in range(steps + 1):
+            if not self.restoring:
+                return
+            
+            t = i / steps  # 0 → 1
+            eased = 1 - (1 - t) ** self.EASING_POWER
+            
+            new_speed = start_speed + (self.RESTORE_TARGET_SPEED - start_speed) * eased
+            self.set_mouse_speed(new_speed)
+            time.sleep(self.RESTORE_STEP_DELAY)
+        
+        self.restoring = False
+        self.set_mouse_speed(self.RESTORE_TARGET_SPEED)
+
     def _auto_move_mouse_to_gaze(self, x, y):
-        """直接传送鼠标到指定位置，无距离判断"""
+        """瞬间传送鼠标到指定位置，记录传送时间并应用系统级速度阻尼"""
         try:
-            # 直接传送鼠标到目标位置，无任何距离判断
+            # 瞬间传送鼠标到目标位置
             win32api.SetCursorPos((int(x), int(y)))
+            
+            # 记录传送时间戳，用于触发传送后速度阻尼效果
+            self.last_teleport_time = time.time() * 1000  # 毫秒时间戳
+            print(f"[INFO] 鼠标传送到: ({int(x)}, {int(y)})")
+            
+            # 传送完成后降低鼠标速度到4（应用test.py方法）
+            self.restoring = False  # 终止之前的恢复过程
+            self.set_mouse_speed(self.TARGET_LOW_SPEED)
+            print(f"[INFO] 鼠标速度降低到: {self.TARGET_LOW_SPEED}")
+            
+            # 在1秒内非线性恢复鼠标速度（应用test.py方法）
+            original_speed = self.TARGET_LOW_SPEED
+            
+            def restore_thread():
+                time.sleep(0.1)  # 稍微延迟，确保传送操作完成
+                start = self.get_mouse_speed()
+                self.restore_speed_ease_out(start)
+                print(f"[INFO] 鼠标速度非线性恢复到: {self.RESTORE_TARGET_SPEED}")
+            
+            restore_thread_obj = threading.Thread(target=restore_thread, daemon=True)
+            restore_thread_obj.start()
             
         except Exception as e:
             pass
@@ -1181,12 +1229,169 @@ class EyeHandInteractionSystem:
 
     def cleanup(self):
         """清理资源"""
+        # 首先停止所有速度恢复过程
+        self.restoring = False
+        
+        # 恢复原始鼠标速度
+        try:
+            if hasattr(self, 'original_mouse_speed') and self.original_mouse_speed is not None:
+                self.set_mouse_speed(self.original_mouse_speed)
+                print(f"[INFO] 鼠标速度已恢复到原始值: {self.original_mouse_speed}")
+        except Exception as e:
+            print(f"[WARNING] 恢复鼠标速度失败: {e}")
+        
+        # 释放其他资源
         if hasattr(self, 'cap') and self.cap:
             self.cap.release()
         if hasattr(self, 'ui'):
             self.ui.close_current_widget()
 
         pass
+
+
+class LightweightKalmanFilter:
+    """轻量级卡尔曼滤波器，专门用于注视点平滑
+    
+    特点：
+    1. 优化的参数配置，自然避免过冲现象
+    2. 平衡平滑效果和响应速度，避免过度滤波导致延迟
+    3. 计算开销低，适合实时应用
+    """
+    
+    def __init__(self, process_noise=0.2, measurement_noise=0.1, error_estimate=50.0):
+        """
+        初始化轻量级卡尔曼滤波器
+        
+        Args:
+            process_noise: 过程噪声，决定滤波器对状态变化的敏感度
+            measurement_noise: 测量噪声，决定滤波器对测量误差的鲁棒性
+            error_estimate: 初始误差估计
+        """
+        self.process_noise = process_noise
+        self.measurement_noise = measurement_noise
+        self.error_estimate = error_estimate
+        
+        # 状态向量 [x, y, vx, vy] - 位置和速度
+        self.state = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        
+        # 状态协方差矩阵
+        self.P = np.eye(4, dtype=np.float32) * error_estimate
+        
+        # 状态转移矩阵（假设匀速运动）
+        self.F = np.array([
+            [1, 0, 1, 0],  # x = x + vx
+            [0, 1, 0, 1],  # y = y + vy
+            [0, 0, 1, 0],  # vx = vx
+            [0, 0, 0, 1]   # vy = vy
+        ], dtype=np.float32)
+        
+        # 观测矩阵（只观测位置）
+        self.H = np.array([
+            [1, 0, 0, 0],  # 观测x
+            [0, 1, 0, 0]   # 观测y
+        ], dtype=np.float32)
+        
+        # 过程噪声协方差矩阵
+        self.Q = np.eye(4, dtype=np.float32) * process_noise
+        
+        # 观测噪声协方差矩阵
+        self.R = np.eye(2, dtype=np.float32) * measurement_noise
+        
+        # 初始化标志
+        self.initialized = False
+        
+    def update(self, measurement):
+        """
+        更新滤波器状态
+        
+        Args:
+            measurement: 观测值 [x, y]
+            
+        Returns:
+            滤波后的状态估计 [x, y, vx, vy]
+        """
+        measurement = np.array(measurement, dtype=np.float32)
+        
+        if not self.initialized:
+            # 初始化：设置初始位置，速度为0
+            self.state[0] = measurement[0]  # x
+            self.state[1] = measurement[1]  # y
+            self.state[2] = 0.0  # vx
+            self.state[3] = 0.0  # vy
+            self.initialized = True
+            return self.state.copy()
+        
+        # 预测步骤
+        # 状态预测: x_pred = F * x
+        x_pred = self.F @ self.state
+        
+        # 协方差预测: P_pred = F * P * F^T + Q
+        P_pred = self.F @ self.P @ self.F.T + self.Q
+        
+        # 更新步骤
+        # 观测预测: z_pred = H * x_pred
+        z_pred = self.H @ x_pred
+        
+        # 观测残差: y = z - z_pred
+        y = measurement - z_pred
+        
+        # 残差协方差: S = H * P_pred * H^T + R
+        S = self.H @ P_pred @ self.H.T + self.R
+        
+        # 卡尔曼增益: K = P_pred * H^T * S^(-1)
+        K = P_pred @ self.H.T @ np.linalg.inv(S)
+        
+        # 状态更新: x = x_pred + K * y
+        self.state = x_pred + K @ y
+        
+        # 协方差更新: P = (I - K * H) * P_pred
+        I = np.eye(4, dtype=np.float32)
+        self.P = (I - K @ self.H) @ P_pred
+        
+        return self.state.copy()
+    
+    def get_position(self):
+        """获取当前滤波后的位置估计"""
+        return np.array([self.state[0], self.state[1]], dtype=np.float32)
+    
+    def get_velocity(self):
+        """获取当前速度估计"""
+        return np.array([self.state[2], self.state[3]], dtype=np.float32)
+    
+    def reset(self):
+        """重置滤波器状态"""
+        self.state = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        self.P = np.eye(4, dtype=np.float32) * self.error_estimate
+        self.initialized = False
+    
+    def is_moving_fast(self, velocity_threshold=50.0):
+        """
+        检测是否在快速移动
+        
+        Args:
+            velocity_threshold: 速度阈值（像素/帧）
+            
+        Returns:
+            bool: 如果当前速度超过阈值，返回True
+        """
+        velocity = self.get_velocity()
+        speed = np.sqrt(velocity[0]**2 + velocity[1]**2)
+        return speed > velocity_threshold
+    
+    def emergency_brake(self):
+        """
+        紧急制动：立即停止当前运动，用于无过冲精准制动控制
+        """
+        # 设置速度为0，但保持当前位置
+        self.state[2] = 0.0  # vx = 0
+        self.state[3] = 0.0  # vy = 0
+        
+        # 增加位置协方差，减少速度协方差，实现快速稳定
+        self.P[0, 0] *= 0.5  # x位置协方差减半，更稳定
+        self.P[1, 1] *= 0.5  # y位置协方差减半，更稳定
+        self.P[2, 2] *= 2.0  # vx协方差加倍，减少速度影响
+        self.P[3, 3] *= 2.0  # vy协方差加倍，减少速度影响
+
 
 def main():
     """主函数"""

@@ -396,7 +396,7 @@ class SimpleHandDetectionSystem:
     def _draw_event_info(self, frame: np.ndarray, is_pinching: bool, is_click: bool, 
                         pinch_info: dict, click_info: dict):
         """
-        绘制事件检测信息
+        绘制事件检测信息 - 显示更详细的调试信息
         """
         # 在左上角显示事件状态
         y_offset = 30
@@ -406,7 +406,17 @@ class SimpleHandDetectionSystem:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             y_offset += 25
             if click_info:
-                cv2.putText(frame, f"捏合强度: {click_info.get('pinch_strength', 0):.2f}", 
+                # 显示点击检测的详细信息
+                cv2.putText(frame, f"距离: {click_info.get('current_distance', 0):.3f}", 
+                           (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                y_offset += 20
+                cv2.putText(frame, f"阈值: {click_info.get('pinch_threshold', 0):.3f}", 
+                           (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                y_offset += 20
+                cv2.putText(frame, f"速度: {click_info.get('distance_velocity', 0):.3f}", 
+                           (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                y_offset += 20
+                cv2.putText(frame, f"手部大小: {click_info.get('hand_size', 0):.3f}", 
                            (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
                 y_offset += 20
         elif is_pinching:
@@ -630,15 +640,16 @@ class ClickDetectionEngine:
     
     def _detect_fast_pinch_sequence(self, landmarks_2d: Optional[List[Tuple]], 
                                    landmarks_3d: Optional[List[List[float]]] = None) -> tuple[bool, dict]:
-        """检测快速捏合序列"""
+        """检测快速捏合序列 - 放宽条件以提高检测灵敏度"""
         current_distance, distance_velocity = self._calculate_pinch_distance_velocity(landmarks_2d, landmarks_3d)
         hand_size = self._calculate_hand_size(landmarks_2d, landmarks_3d)
         
-        pinch_threshold = hand_size * 0.4  # 调大阈值，降低灵敏度
+        # 放宽捏合阈值 - 从0.2降低到0.35，更容易触发捏合
+        pinch_threshold = hand_size * 0.35
         is_pinching = current_distance < pinch_threshold
         
-        # 检测快速接近（调高速度阈值）
-        is_approaching = distance_velocity > hand_size * 3
+        # 放宽接近速度阈值 - 从hand_size降低到hand_size * 0.5，更容易检测接近
+        is_approaching = distance_velocity > hand_size * 0.5
         
         # 更新状态历史
         current_time = time.time()
@@ -654,21 +665,28 @@ class ClickDetectionEngine:
         if len(self.velocity_tracker['approach_history']) > 10:
             self.velocity_tracker['approach_history'].pop(0)
         
-        # 分析快速捏合序列
+        # 放宽快速捏合序列分析条件
         is_fast_pinch = False
         
-        if len(self.velocity_tracker['approach_history']) >= 3:
+        if len(self.velocity_tracker['approach_history']) >= 2:  # 从3帧降低到2帧
             recent_history = self.velocity_tracker['approach_history'][-5:]
             approach_frames = sum(1 for frame in recent_history if frame['approaching'])
-            recent_pinch = any(frame['pinching'] for frame in recent_history[-3:])
+            recent_pinch = any(frame['pinching'] for frame in recent_history[-2:])  # 从3帧降低到2帧
             
-            is_fast_pinch = (approach_frames >= 2 and 
+            # 放宽条件：降低接近帧数要求和速度要求
+            is_fast_pinch = (approach_frames >= 1 and  # 从2帧降低到1帧
                            recent_pinch and 
-                           distance_velocity > hand_size * 0.9)
+                           distance_velocity > hand_size * 0.3)  # 从0.9降低到0.3
         
-        # 精简调试信息
+        # 添加更详细的调试信息
         debug_info = {
-            'is_fast_pinch': is_fast_pinch
+            'is_fast_pinch': is_fast_pinch,
+            'current_distance': current_distance,
+            'pinch_threshold': pinch_threshold,
+            'is_pinching': is_pinching,
+            'is_approaching': is_approaching,
+            'distance_velocity': distance_velocity,
+            'hand_size': hand_size
         }
         
         return is_fast_pinch, debug_info

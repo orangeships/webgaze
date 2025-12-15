@@ -7,7 +7,6 @@ import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-# 从calibration_pygame导入工具函数，不再使用gui_opencv
 from gaze_tracking.calibration_pygame import PygameCalibrationUI, PygameCalibrationTargets, getScreenSize, getWhiteFrame, ReadCameraCalibrationData
 from sfm.sfm_module import SFM
 import utilities.utils as util
@@ -26,9 +25,40 @@ class HomTransform:
     """
     Calibration from gaze coordinates to screen coordinates
     """
-    def __init__(self, directory) -> None:            
+    def __init__(self, directory, custom_width=None, custom_height=None) -> None:            
         self.dir = directory
-        self.width, self.height, self.width_mm, self.height_mm = getScreenSize()
+        if custom_width and custom_height:
+            # 使用自定义的屏幕尺寸
+            self.width = custom_width
+            self.height = custom_height
+            # 尝试获取对应显示器的物理尺寸
+            try:
+                from screeninfo import get_monitors
+                monitors = get_monitors()
+                # 找到最接近的显示器
+                min_distance = float('inf')
+                target_monitor = None
+                for monitor in monitors:
+                    # 计算分辨率差的平方和作为距离
+                    distance = (monitor.width - custom_width)**2 + (monitor.height - custom_height)**2
+                    if distance < min_distance:
+                        min_distance = distance
+                        target_monitor = monitor
+                if target_monitor:
+                    self.width_mm = target_monitor.width_mm
+                    self.height_mm = target_monitor.height_mm
+                else:
+                    # 如果找不到匹配的显示器，使用默认值
+                    self.width_mm = 521  # 2560x1440显示器的典型宽度（mm）
+                    self.height_mm = 293  # 2560x1440显示器的典型高度（mm）
+            except:
+                # 如果screeninfo不可用，使用默认值
+                self.width_mm = 521
+                self.height_mm = 293
+            # print(f"使用自定义屏幕尺寸: {self.width}x{self.height}, 物理尺寸: {self.width_mm}mmx{self.height_mm}mm")
+        else:
+            # 使用默认的屏幕尺寸获取方法
+            self.width, self.height, self.width_mm, self.height_mm = getScreenSize()
         self.df = pd.DataFrame()
         self.sfm = SFM(directory)
         self.camera_matrix, self.dist_coeffs = ReadCameraCalibrationData(os.path.join(directory, "camera_data"))
@@ -38,6 +68,16 @@ class HomTransform:
         
         # 调试计数器
         self.debug_counter = 0  # 调试计数器
+        
+        # 重要：初始化校准相关的属性，防止属性不存在错误
+        self.STransG = None  # 校准变换矩阵，初始化为None
+        self.scaleWtG = None  # 缩放因子，初始化为None
+        self.scaleWtG2 = None  # 第二个缩放因子，初始化为None
+        self.STransW = None  # 世界坐标变换矩阵，初始化为None
+        self.StG = None  # 注视点变换矩阵列表，初始化为None
+        self.StW = None  # 世界坐标变换矩阵列表，初始化为None
+        self.SetVal = None  # 校准点值，初始化为None
+        self.gaze = None  # 注视数据，初始化为None
 
     def RecordGaze(self, model, cap, sfm=False):
         df = pd.DataFrame()
@@ -110,9 +150,6 @@ class HomTransform:
         
         while cap.isOpened():
             
-            # gazeframe, SetPos = target.DrawTargetGaze(white_frame, self._mm2pixel(FSgaze))
-            # gazeframe, SetPos = target.DrawRectangularTargets(white_frame, self._mm2pixel(FSgaze))
-            # gazeframe, SetPos = target.DrawSingleTargets(white_frame, self._mm2pixel(FSgaze))
             gazeframe, SetPos = targets.DrawTargetInMiddle(white_frame.copy(), self._mm2pixel(FSgaze)) # 传入副本，避免修改原始white_frame
 
             try:
@@ -180,26 +217,7 @@ class HomTransform:
             if elapsed_time > 1.0:  # 每秒更新一次帧率
                 pass  # FPS输出已移至main_pygame.py，避免重复输出
             
-            # 进一步减少Tkinter窗口更新频率 - OpenCV不需要这个
-            # if window_update_counter % 20 == 0:  # 每20帧更新一次
-            #     try:
-            #         # 简化窗口更新逻辑，减少异常处理开销
-            #         if hasattr(self, 'renderer') and self.renderer:
-            #             try:
-            #                 # 仅尝试基本更新，不进行复杂检查
-            #                 self.renderer.update_idletasks()  # 使用update_idletasks代替update，减轻CPU负担
-            #             except Exception:
-            #                 # 发生任何异常，直接销毁渲染器并继续
-            #                 try:
-            #                     self.renderer = None
-            #                 except:
-            #                     pass
-            #     except Exception:
-            #         # 静默处理所有异常
-            #         pass
-                
-            # 检查键盘事件 - 降低检查频率
-            # if window_update_counter % 5 == 0: # OpenCV不需要这个
+           # if window_update_counter % 5 == 0: # OpenCV不需要这个
             key_pressed = cv2.waitKey(1)
             if key_pressed == 27:  # ESC键退出
                 print("退出追踪")
@@ -214,7 +232,6 @@ class HomTransform:
         # 释放视频输出资源（如果有）
         if out_video is not None:
             out_video.release()
-        
         # 关闭所有OpenCV窗口
         try:
             cv2.destroyAllWindows()
@@ -226,7 +243,7 @@ class HomTransform:
 
 
 
-    def calibrate(self, model, cap, sfm=False):
+    def calibrate(self, model, cap, sfm=False, display_index=0, filename=None):
         """
         校准方法 - 仅使用Pygame界面
         
@@ -234,6 +251,8 @@ class HomTransform:
             model: 视线估计模型
             cap: 摄像头捕获对象
             sfm: 是否使用SfM（结构光）
+            display_index: pygame显示器索引，指定在哪个显示器上显示校准界面
+            filename: 指定校准结果文件名（可选）
             
         Returns:
             STransG: 校准变换矩阵，如果取消则返回None
@@ -242,18 +261,18 @@ class HomTransform:
             print("错误：Pygame未安装，无法进行校准")
             return None
             
-        return self._calibrate_pygame(model, cap, sfm)
+        return self._calibrate_pygame(model, cap, sfm, display_index, filename)
     
-    def _calibrate_pygame(self, model, cap, sfm=False):
+    def _calibrate_pygame(self, model, cap, sfm=False, display_index=0, filename=None):
         """Pygame版本的校准方法"""
-        print("使用Pygame校准界面...")
+        print(f"使用Pygame校准界面 (显示器索引: {display_index})...")
         
         # 初始化Pygame（如果尚未初始化）
         if not pygame.get_init():
             pygame.init()
         
-        # 创建Pygame校准界面
-        calib_ui = PygameCalibrationUI(self.width, self.height)
+        # 创建Pygame校准界面，传入指定的显示器索引
+        calib_ui = PygameCalibrationUI(self.width, self.height, display_index=display_index)
         calib_ui.initialize()
         
         # 获取摄像头尺寸
@@ -306,7 +325,26 @@ class HomTransform:
             except Exception as e:
                 print(f"预热过程中出错: {e}")
         
-        print("模型预热完成，开始正式校准流程")
+        print("模型预热完成，显示预校准提示界面")
+        
+        # 显示预校准提示界面，等待用户按空格键开始
+        calib_ui.show_precalibration_screen()
+        
+        # 等待用户按键开始校准
+        waiting_for_start = True
+        while waiting_for_start:
+            # 处理事件
+            event = calib_ui.handle_events()
+            if event == 'quit':
+                calib_ui.cleanup()
+                return None
+            elif event == 'start':  # 空格键或S键
+                waiting_for_start = False
+                break
+            
+            calib_ui.clock.tick(30)
+        
+        print("用户确认开始校准，正式校准流程开始")
         
         # 创建校准目标管理器
         calib_targets = PygameCalibrationTargets(self.width, self.height)
@@ -398,11 +436,11 @@ class HomTransform:
         self._WriteStatsInFile(STransG)
         
         # 保存校准结果
-        self._save_calibration_results(STransG, g, SetVal, gaze, sfm, STransW if sfm else None, scaleWtG if sfm else None)
+        self._save_calibration_results(STransG, g, SetVal, gaze, sfm, STransW if sfm else None, scaleWtG if sfm else None, filename)
         
         return STransG
     
-    def _save_calibration_results(self, STransG, g, SetVal, gaze, sfm=False, STransW=None, scaleWtG=None):
+    def _save_calibration_results(self, STransG, g, SetVal, gaze, sfm=False, STransW=None, scaleWtG=None, filename=None):
         """
         保存完整的校准结果，包括设备信息和校准点数据（仅JSON格式）
         """
@@ -461,8 +499,12 @@ class HomTransform:
                 'StW': [stw.tolist() for stw in self.StW] if hasattr(self, 'StW') else []
             }
         
-        # 保存为JSON文件
-        json_file = os.path.join(self.dir, "results", "calibration_results.json")
+        # 保存为JSON文件 - 支持指定文件名
+        if filename:
+            json_file = os.path.join(self.dir, "results", filename)
+        else:
+            json_file = os.path.join(self.dir, "results", "calibration_results.json")
+        
         with open(json_file, 'w', encoding='utf-8') as f:
             json.dump(calibration_data, f, indent=2, ensure_ascii=False)
         

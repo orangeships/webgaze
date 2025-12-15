@@ -6,11 +6,16 @@ import os
 class PygameCalibrationUI:
     """Pygame校准界面类"""
     
-    def __init__(self, width, height):
+    def __init__(self, width, height, display_index=0):
         self.width = width
         self.height = height
+        self.display_index = display_index
         self.screen = None
         self.clock = pygame.time.Clock()
+        
+        # 保存初始显示器数量，避免校准过程中丢失
+        self.initial_display_count = pygame.display.get_num_displays()
+        print(f"PygameCalibrationUI初始化: 显示器索引={display_index}, 初始检测到{self.initial_display_count}个显示器")
         
         # 颜色定义
         self.WHITE = (255, 255, 255)
@@ -46,9 +51,61 @@ class PygameCalibrationUI:
         
     def initialize(self):
         """初始化Pygame显示"""
-        # 设置全屏显示
-        self.screen = pygame.display.set_mode((self.width, self.height), pygame.FULLSCREEN | pygame.NOFRAME)
+        # 重新获取当前显示器数量，避免缓存导致的问题
+        available_displays = pygame.display.get_num_displays()
+        
+        print(f"当前检测到的显示器信息: {available_displays} 个可用显示器")
+        
+        # 确保显示器索引在有效范围内
+        effective_display_index = 0  # 默认使用主显示器
+        if hasattr(self, 'display_index'):
+            if 0 <= self.display_index < available_displays:
+                effective_display_index = self.display_index
+                print(f"尝试在显示器{effective_display_index}创建校准窗口")
+            else:
+                print(f"显示器索引 {self.display_index} 超出有效范围 (0-{available_displays-1})，回退到主显示器")
+                effective_display_index = 0
+        
+        # 使用有效显示器索引创建全屏窗口
+        try:
+            self.screen = pygame.display.set_mode((self.width, self.height), pygame.FULLSCREEN | pygame.NOFRAME, display=effective_display_index)
+            if effective_display_index > 0:
+                print(f"成功在显示器{effective_display_index}创建全屏窗口")
+            else:
+                print("成功在主显示器创建全屏窗口")
+        except Exception as e:
+            print(f"在显示器{effective_display_index}创建窗口失败，回退到主显示器: {e}")
+            self.screen = pygame.display.set_mode((self.width, self.height), pygame.FULLSCREEN | pygame.NOFRAME)
+        
         pygame.display.set_caption("视线追踪校准")
+        
+        # 初始化字体
+        try:
+            self.font_large = pygame.font.Font("C:\Windows\Fonts\simhei.ttf", 48)
+            self.font_medium = pygame.font.Font("C:\Windows\Fonts\simhei.ttf", 32)
+            self.font_small = pygame.font.Font("C:\Windows\Fonts\simhei.ttf", 24)
+        except:
+            # 如果中文字体不可用，使用默认字体
+            self.font_large = pygame.font.Font(None, 48)
+            self.font_medium = pygame.font.Font(None, 32)
+            self.font_small = pygame.font.Font(None, 24)
+    
+    def initialize_with_display(self, screen_config):
+        """使用特定屏幕配置初始化Pygame显示"""
+        # 尝试在指定显示器上设置模式，如果失败则回退到默认显示器
+        try:
+            # 对于所有显示器都使用全屏模式，确保校准点显示在正确位置
+            flags = pygame.FULLSCREEN | pygame.NOFRAME
+            self.screen = pygame.display.set_mode((self.width, self.height), flags, display=self.display_index)
+            
+            pygame.display.set_caption(f"视线追踪校准 - {screen_config.get('name', f'屏幕{self.display_index+1}')}")
+            print(f"成功在显示器{self.display_index} ({screen_config.get('name', f'显示器{self.display_index+1}')}) 创建全屏窗口")
+        except Exception as e:
+            print(f"在显示器{self.display_index}上创建窗口失败，回退到主显示器: {e}")
+            # 回退到主显示器
+            self.display_index = 0
+            self.screen = pygame.display.set_mode((self.width, self.height), pygame.FULLSCREEN | pygame.NOFRAME, display=0)
+            pygame.display.set_caption("视线追踪校准")
         
         # 初始化字体
         try:
@@ -135,11 +192,60 @@ class PygameCalibrationUI:
         
         pygame.display.flip()
     
+    def show_precalibration_screen(self):
+        """显示预校准提示界面"""
+        self.screen.fill(self.WHITE)
+        
+        # 标题
+        title_text = self.font_large.render("校准即将开始", True, self.BLACK)
+        title_rect = title_text.get_rect(center=(self.width // 2, self.height // 3))
+        self.screen.blit(title_text, title_rect)
+        
+        # 说明文字
+        instruction_text1 = self.font_medium.render("请依次注视屏幕四角和中心的校准点", True, self.BLACK)
+        instruction_rect1 = instruction_text1.get_rect(center=(self.width // 2, self.height // 2 - 30))
+        self.screen.blit(instruction_text1, instruction_rect1)
+        
+        instruction_text2 = self.font_medium.render("准备好后，请按空格键开始校准", True, self.BLACK)
+        instruction_rect2 = instruction_text2.get_rect(center=(self.width // 2, self.height // 2 + 20))
+        self.screen.blit(instruction_text2, instruction_rect2)
+        
+        # 校准点位置预览（显示5个校准点的位置）
+        margin_x = int(self.width * self.margin_ratio)
+        margin_y = int(self.height * self.margin_ratio)
+        
+        # 5点校准位置预览
+        preview_points = [
+            (margin_x, margin_y),  # 左上角
+            (self.width - margin_x, margin_y),  # 右上角
+            (margin_x, self.height - margin_y),  # 左下角
+            (self.width - margin_x, self.height - margin_y),  # 右下角
+            (self.width // 2, self.height // 2)  # 屏幕中心
+        ]
+        
+        # 绘制校准点位置预览
+        for i, (x, y) in enumerate(preview_points):
+            pygame.draw.circle(self.screen, self.RED, (x, y), 20, 2)
+            # 标注点编号
+            number_text = self.font_small.render(str(i + 1), True, self.RED)
+            number_rect = number_text.get_rect(center=(x, y))
+            self.screen.blit(number_text, number_rect)
+        
+        # 按键提示
+        key_text = self.font_medium.render("按空格键开始校准 | 按ESC键退出", True, self.GRAY)
+        key_rect = key_text.get_rect(center=(self.width // 2, self.height - 100))
+        self.screen.blit(key_text, key_rect)
+        
+        pygame.display.flip()
+        
+        return preview_points
+    
     def show_calibration_point(self, point_idx, gaze_point=None):
         """显示校准点（带律动效果）"""
         self.screen.fill(self.WHITE)
         
         if point_idx < self.total_points:
+            # 使用屏幕本地坐标，不应用任何偏移，确保完全独立的屏幕校准
             point_pos = self.calib_points[point_idx]
             
             # 更新动画时间（使用delta time确保不同帧率下动画速度一致）
@@ -247,7 +353,7 @@ class PygameCalibrationUI:
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     return 'quit'
-                elif event.key == pygame.K_s or event.key == pygame.K_S:
+                elif event.key == pygame.K_s or event.key == pygame.K_SPACE:
                     return 'start'
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 return 'click'
