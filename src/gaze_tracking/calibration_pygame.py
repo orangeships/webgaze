@@ -81,9 +81,9 @@ class PygameCalibrationUI:
         
         # 初始化字体
         try:
-            self.font_large = pygame.font.Font("C:\Windows\Fonts\simhei.ttf", 48)
-            self.font_medium = pygame.font.Font("C:\Windows\Fonts\simhei.ttf", 32)
-            self.font_small = pygame.font.Font("C:\Windows\Fonts\simhei.ttf", 24)
+            self.font_large = pygame.font.Font(r"C:\Windows\Fonts\simhei.ttf", 48)
+            self.font_medium = pygame.font.Font(r"C:\Windows\Fonts\simhei.ttf", 32)
+            self.font_small = pygame.font.Font(r"C:\Windows\Fonts\simhei.ttf", 24)
         except:
             # 如果中文字体不可用，使用默认字体
             self.font_large = pygame.font.Font(None, 48)
@@ -109,9 +109,9 @@ class PygameCalibrationUI:
         
         # 初始化字体
         try:
-            self.font_large = pygame.font.Font("C:\Windows\Fonts\simhei.ttf", 48)
-            self.font_medium = pygame.font.Font("C:\Windows\Fonts\simhei.ttf", 32)
-            self.font_small = pygame.font.Font("C:\Windows\Fonts\simhei.ttf", 24)
+            self.font_large = pygame.font.Font(r"C:\Windows\Fonts\simhei.ttf", 48)
+            self.font_medium = pygame.font.Font(r"C:\Windows\Fonts\simhei.ttf", 32)
+            self.font_small = pygame.font.Font(r"C:\Windows\Fonts\simhei.ttf", 24)
         except:
             # 如果中文字体不可用，使用默认字体
             self.font_large = pygame.font.Font(None, 48)
@@ -380,7 +380,7 @@ class PygameCalibrationUI:
         if idx < self.total_points:
             return idx, self.calib_points[idx]
         else:
-            print("校准完成！")
+            print("校准完成（calbi！")
             return None, np.array([0, 0])
     
     def start_calibration(self):
@@ -408,7 +408,7 @@ class PygameCalibrationTargets:
         self.tstart = 0
         self.current_idx = -1  # 当前校准点索引
         self.point_start_time = 0  # 当前校准点显示的开始时间
-        self.delay_recording = 0.5  # 记录延迟时间（秒）
+        self.delay_recording = 0.2  # 记录延迟时间（秒）
         self.can_record = False  # 是否可以开始记录数据
         
     def _build_grid_points(self):
@@ -463,17 +463,70 @@ def getWhiteFrame(height, width):
 
 
 def getScreenSize():
-    """获取屏幕尺寸信息"""
+    """获取屏幕尺寸信息，添加重试机制和错误处理"""
     import screeninfo
-    screen = screeninfo.get_monitors()
-    for s in screen:
-        if s.is_primary:
-            width = s.width
-            height = s.height
-            width_mm = s.width_mm
-            height_mm = s.height_mm
-    print(f"Screen Size: {width}x{height}")
-    return width, height, width_mm, height_mm
+    import time
+    
+    max_retries = 10
+    retry_delay = 0.1  # 100ms延迟
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"尝试获取屏幕信息 (第 {attempt + 1} 次)...")
+            screen = screeninfo.get_monitors()
+            
+            if not screen:
+                print(f"未检测到任何显示器，重试中...")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    raise Exception("无法检测到任何显示器")
+            
+            # 寻找主显示器
+            primary_monitor = None
+            for s in screen:
+                if s.is_primary:
+                    primary_monitor = s
+                    break
+            
+            # 如果没找到主显示器，使用第一个显示器
+            if primary_monitor is None:
+                print("未找到主显示器，使用第一个可用显示器")
+                primary_monitor = screen[0]
+            
+            width = primary_monitor.width
+            height = primary_monitor.height
+            width_mm = primary_monitor.width_mm
+            height_mm = primary_monitor.height_mm
+            
+            # 验证数据有效性 - 首先检查是否为None
+            if width is None or height is None:
+                raise Exception(f"获取到None的屏幕尺寸: width={width}, height={height}")
+            
+            if width <= 0 or height <= 0:
+                raise Exception(f"获取到无效的屏幕尺寸: {width}x{height}")
+            
+            # 检查物理尺寸，可能为None
+            if width_mm is None or height_mm is None:
+                raise Exception(f"无法获取物理尺寸: width_mm={width_mm}, height_mm={height_mm}")
+            elif width_mm <= 0 or height_mm <= 0:
+                raise Exception(f"获取到无效的物理尺寸: {width_mm}mm x {height_mm}mm")
+            
+            print(f"成功获取屏幕信息: {width}x{height}, 物理尺寸: {width_mm}mmx{height_mm}mm")
+            return width, height, width_mm, height_mm
+            
+        except Exception as e:
+            print(f"获取屏幕信息失败 (第 {attempt + 1} 次): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
+            else:
+                print("所有重试均失败，抛出异常")
+                raise e
+    
+    # 这里不应该到达，但为了安全起见
+    raise Exception("重试机制失败，无法获取屏幕信息")
 
 
 def ReadCameraCalibrationData(calibration_path, file_name = "calibration_data.txt"):

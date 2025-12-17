@@ -63,11 +63,13 @@ class EyeHandInteractionSystem:
         self.calibration_data = None
         
         # 双屏支持相关
-        self.calibration_mode = "single"  # 校准模式：single 或 dual
+        self.calibration_mode = "single"  # 校准模式：single 或 multi
         self.is_dual_screen_mode = False  # 标志位，指示是否为双屏模式
         
-        # 上一帧的绝对坐标注视点，用于平滑过渡
-        self.last_gaze_point_abs = None
+        # 跨屏坐标转换支持
+        self.screen_switching = False  # 标志位，防止屏幕切换过程中重复触发
+        self.last_gaze_point_abs = None  # 存储上一帧的绝对坐标注视点，用于平滑过渡
+        self.screen_switching_adaptation_frames = 0  # 屏幕切换后的卡尔曼滤波适应帧数
         
         # 统一的阈值配置管理器
         self.threshold_config = {
@@ -77,7 +79,7 @@ class EyeHandInteractionSystem:
             'gaze_dispersion_frames': 6,     # 注视点分析使用的帧数
             'angle_threshold': 3.0,          # 角度离散度阈值（度） 
             'pixel_threshold': 100,          # 像素离散度阈值（像素）
-            'boundary_buffer': 20,           # 屏幕边界缓冲区（像素）
+            'boundary_buffer': 20,          # 屏幕边界缓冲区（像素）- 增加到100像素，避免边缘区域失效
             'interaction_zone_duration': 500,  # 交互区域显示持续时间（毫秒）
             # 鼠标移动触发相关配置
             'mouse_movement_threshold': 300,  # 鼠标移动触发阈值（像素）
@@ -86,7 +88,11 @@ class EyeHandInteractionSystem:
             'sliding_window_time_limit': 350,   # 滑动窗口时间限制（毫秒）
             'mad_threshold': 50,               # 稳定凝视MAD阈值（像素）
             'perc95_threshold': 120,           # 稳定凝视95%百分位阈值（像素）
-            'sliding_window_angle_threshold': 3.0  # 滑动窗口角度阈值
+            'sliding_window_angle_threshold': 3.0,  # 滑动窗口角度阈值
+            # UI辅助跳转相关配置
+            'ui_assisted_jump_enabled': True,         # UI辅助跳转功能开关
+            'ui_control_max_size': 500,               # UI控件最大尺寸（像素），超过则忽略
+            'scatter_detection_radius': 100,          # 散布检测半径（像素）
         }
         
         # 初始化注视点分析器，使用统一配置
@@ -163,7 +169,53 @@ class EyeHandInteractionSystem:
     
     def switch_to_monitor_with_coordinate_update(self, target_screen):
         """切换到目标屏幕并更新坐标"""
-        return self.screen_manager.switch_to_monitor_with_coordinate_update(target_screen, self.homtrans, self.dispersion_analyzer, self.kalman_filter)
+        # 检查是否已经是最优显示器
+        if target_screen == self.screen_manager.current_monitor_index or target_screen >= len(self.ui.monitors_info):
+            return False
+            
+        try:
+            # 设置屏幕切换标志
+            self.screen_switching = True
+            
+            # 保存当前状态
+            last_gaze_point = self.last_gaze_point_abs
+            
+            # 切换显示器
+            if self.screen_manager.switch_to_monitor(target_screen, self.homtrans, self.dispersion_analyzer):
+                # 重新初始化卡尔曼滤波器以适应新屏幕
+                self.kalman_filter = LightweightKalmanFilter(
+                    process_noise=0.8,  # 增加过程噪声，加速适应新屏幕
+                    measurement_noise=0.4,  # 增加测量噪声，减少拖拽效应
+                    error_estimate=2.0  # 增加初始误差估计
+                )
+                # 设置屏幕切换标志，短期内禁用平滑以快速适应新坐标
+                self.screen_switching_adaptation_frames = 5  # 屏幕切换后5帧内快速适应
+                print(f"[DEBUG] 屏幕切换到{target_screen}，卡尔曼滤波器已重置，将快速适应新坐标")
+                
+                # 如果有上一帧注视点，将其转换为新屏幕的坐标
+                if last_gaze_point:
+                    # 将绝对坐标转换为新屏幕的相对坐标
+                    new_gaze_x = last_gaze_point[0] - self.ui.monitors_info[target_screen]['x']
+                    new_gaze_y = last_gaze_point[1] - self.ui.monitors_info[target_screen]['y']
+                    
+                    # 更新离散度分析器的屏幕尺寸
+                    self.dispersion_analyzer.set_screen_dimensions(
+                        self.ui.monitors_info[target_screen]['width'],
+                        self.ui.monitors_info[target_screen]['height']
+                    )
+                
+                self.screen_switching = False
+                return True
+            else:
+                self.screen_switching = False
+                return False
+            
+        except Exception as e:
+            print(f"切换屏幕失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.screen_switching = False
+            return False
     
     def _smooth_gaze_point(self, raw_gaze_point):
         """使用卡尔曼滤波平滑注视点"""
@@ -208,13 +260,13 @@ class EyeHandInteractionSystem:
         """运行校准
         
         Args:
-            interaction_mode: 'single' 或 'dual'
+            interaction_mode: 'single' 或 'multi'
             auto_load: 是否自动加载校准数据（多屏模式）
         """
         print(f"开始{interaction_mode}模式校准...")
         
         # 如果是自动加载模式，直接尝试加载校准数据
-        if auto_load and interaction_mode == 'dual':
+        if auto_load and interaction_mode == 'multi':
             print("自动加载模式：尝试加载已存在的校准数据...")
             load_success = self.load_calibration_data(interaction_mode, auto_select=True)
             if load_success:
@@ -319,7 +371,7 @@ class EyeHandInteractionSystem:
         """根据交互模式加载对应的校准数据
         
         Args:
-            interaction_mode: 'single' 或 'dual'
+            interaction_mode: 'single' 或 'multi'
             auto_select: 是否自动选择显示器（多屏模式）
         """
         print(f"开始加载 {interaction_mode} 模式的校准数据...")
@@ -382,113 +434,6 @@ class EyeHandInteractionSystem:
             traceback.print_exc()
             return False
     
-    def show_monitor_selection(self):
-        """显示显示器选择界面（用于多屏模式加载校准数据）"""
-        # 如果校准结果为空，先尝试扫描可用的校准文件
-        if not self.screen_manager.calibration_results:
-            print("正在扫描可用的校准文件...")
-            self.screen_manager._load_all_calibration_results()
-            
-        if not self.screen_manager.calibration_results:
-            # 如果仍然没有校准结果，检查文件系统
-            results_dir = os.path.join(self.project_dir, "results")
-            available_files = []
-            
-            for i in range(len(self.ui.monitors_info)):
-                calibration_file = os.path.join(results_dir, f"calibration_results_screen_{i}.json")
-                if os.path.exists(calibration_file):
-                    available_files.append((i, calibration_file))
-            
-            if not available_files:
-                QMessageBox.information(None, "提示", "没有找到任何校准文件")
-                return None
-            
-            # 创建显示器选择界面
-            dialog = QDialog()
-            dialog.setWindowTitle("选择显示器")
-            dialog.setModal(True)
-            dialog.resize(400, 300)
-            
-            layout = QVBoxLayout(dialog)
-            
-            # 添加说明文字
-            label = QLabel("请选择要加载校准数据的显示器:")
-            layout.addWidget(label)
-            
-            # 为每个有校准文件的显示器创建按钮
-            for monitor_index, calibration_file in available_files:
-                try:
-                    with open(calibration_file, 'r', encoding='utf-8') as f:
-                        calibration_data = json.load(f)
-                    
-                    # 获取显示器信息
-                    monitor = self.ui.monitors_info[monitor_index]
-                    button_text = f"显示器 {monitor_index}: {monitor['width']}x{monitor['height']}"
-                    button = QPushButton(button_text)
-                    
-                    def make_callback(idx):
-                        def callback():
-                            dialog.accept()
-                            dialog.selected_monitor = idx
-                        return callback
-                    
-                    button.clicked.connect(make_callback(monitor_index))
-                    layout.addWidget(button)
-                except Exception as e:
-                    print(f"读取显示器 {monitor_index} 校准文件失败: {e}")
-            
-            # 添加取消按钮
-            cancel_button = QPushButton("取消")
-            cancel_button.clicked.connect(dialog.reject)
-            layout.addWidget(cancel_button)
-            
-            # 显示对话框
-            result = dialog.exec_()
-            if result == QDialog.Accepted and hasattr(dialog, 'selected_monitor'):
-                return dialog.selected_monitor
-            else:
-                return None
-        else:
-            # 创建显示器选择界面
-            dialog = QDialog()
-            dialog.setWindowTitle("选择显示器")
-            dialog.setModal(True)
-            dialog.resize(400, 300)
-            
-            layout = QVBoxLayout(dialog)
-            
-            # 添加说明文字
-            label = QLabel("请选择要加载校准数据的显示器:")
-            layout.addWidget(label)
-            
-            # 为每个有校准数据的显示器创建按钮
-            buttons = []
-            for monitor_index in sorted(self.screen_manager.calibration_results.keys()):
-                monitor_data = self.screen_manager.calibration_results[monitor_index]
-                button_text = f"显示器 {monitor_index}: {monitor_data['width']}x{monitor_data['height']}"
-                button = QPushButton(button_text)
-                
-                def make_callback(idx):
-                    def callback():
-                        dialog.accept()
-                        dialog.selected_monitor = idx
-                    return callback
-                
-                button.clicked.connect(make_callback(monitor_index))
-                layout.addWidget(button)
-                buttons.append(button)
-            
-            # 添加取消按钮
-            cancel_button = QPushButton("取消")
-            cancel_button.clicked.connect(dialog.reject)
-            layout.addWidget(cancel_button)
-            
-            # 显示对话框
-            result = dialog.exec_()
-            if result == QDialog.Accepted and hasattr(dialog, 'selected_monitor'):
-                return dialog.selected_monitor
-            else:
-                return None
     
     def run_interaction_mode(self):
         """运行交互模式 - 支持多屏幕环境"""
@@ -588,32 +533,31 @@ class EyeHandInteractionSystem:
                         gaze_y_abs = int(screen_pos_px[1] + monitor['y'])
                         
                         # 计算相对当前屏幕的坐标
-                        gaze_x_rel = max(0, min(screen_pos_px[0], self.ui.screen_width))
-                        gaze_y_rel = max(0, min(screen_pos_px[1], self.ui.screen_height))
-                    else:
-                        # 默认使用屏幕中心
+                        # 原始相对坐标，不限制范围，用于手眼协调机制
+                        gaze_x_rel_original = screen_pos_px[0]
+                        gaze_y_rel_original = screen_pos_px[1]
+                        
+                        # 显示用相对坐标，限制在屏幕范围内，用于生成绿色渐变圆圈
+                        gaze_x_rel = max(0, min(screen_pos_px[0], self.ui.screen_width - 1))
+                        gaze_y_rel = max(0, min(screen_pos_px[1], self.ui.screen_height - 1))
+                        
+                        # 用于绿色渐变圆圈的绝对坐标，确保在屏幕内
                         monitor = self.ui.monitors_info[self.screen_manager.current_monitor_index]
-                        gaze_x_abs = monitor['x'] + monitor['width'] // 2
-                        gaze_y_abs = monitor['y'] + monitor['height'] // 2
-                        gaze_x_rel = self.ui.screen_width // 2
-                        gaze_y_rel = self.ui.screen_height // 2
-
+                        self.fade_circle_x = int(gaze_x_rel + monitor['x'])
+                        self.fade_circle_y = int(gaze_y_rel + monitor['y'])
+                    
                     # 应用卡尔曼滤波平滑算法 - 使用相对坐标进行平滑
                     raw_gaze_point = (gaze_x_rel, gaze_y_rel)
 
-                    # 使用轻量卡尔曼滤波算法
-                    if self.smoothing_enabled:
-                        # 屏幕切换后，短期内禁用平滑以快速适应新坐标
-                        if hasattr(self.screen_manager, 'screen_switching_adaptation_frames') and self.screen_manager.screen_switching_adaptation_frames > 0:
-                            # 直接使用原始注视点，快速适应新屏幕
-                            gaze_point_rel = raw_gaze_point
-                            # 减少适应帧数
-                            self.screen_manager.screen_switching_adaptation_frames -= 1
-                        else:
-                            # 正常使用卡尔曼滤波平滑
-                            gaze_point_rel = self._smooth_gaze_point(raw_gaze_point)
-                    else:
+                    # 检查是否处于屏幕切换适应期
+                    if (hasattr(self, 'screen_switching_adaptation_frames') and 
+                        self.screen_switching_adaptation_frames > 0):
+                        # 在适应期内，返回原始坐标以避免卡尔曼滤波的拖拽效应
                         gaze_point_rel = raw_gaze_point
+                        self.screen_switching_adaptation_frames -= 1
+                    else:
+                        # 使用卡尔曼滤波器平滑注视点
+                        gaze_point_rel = self._smooth_gaze_point(raw_gaze_point)
 
                     current_gaze_point_rel = gaze_point_rel
 
@@ -625,7 +569,8 @@ class EyeHandInteractionSystem:
                     self.last_gaze_point_abs = current_gaze_point_abs
 
                     # 实时监测注视点位置，实现屏幕自动切换（仅在多屏模式下启用）
-                    if (not self.screen_manager.screen_switching and len(self.ui.monitors_info) > 1 and self.is_dual_screen_mode):
+                    if (not self.screen_switching and len(self.ui.monitors_info) > 1 and 
+                        hasattr(self, 'is_dual_screen_mode') and self.is_dual_screen_mode):
                         # 检查注视点是否超出当前屏幕边界
                         if self.screen_manager.is_gaze_out_of_screen(smoothed_gaze_x_abs, smoothed_gaze_y_abs, self.screen_manager.current_monitor_index):
                             # 获取目标屏幕索引
@@ -639,8 +584,22 @@ class EyeHandInteractionSystem:
                                 gaze_x_rel, gaze_y_rel = self.screen_manager.convert_abs_to_rel_coordinate(
                                     smoothed_gaze_x_abs, smoothed_gaze_y_abs, target_screen)
                     
-                    # 手眼协调机制处理（使用相对坐标）
-                    self.hand_eye_coordinator._process_hand_eye_coordination(gaze_point_rel, previous_gaze_point, self.is_dual_screen_mode)
+                    # 手眼协调机制处理（使用原始相对坐标，不限制范围）
+                    # 创建原始相对坐标的卡尔曼滤波结果
+                    raw_gaze_point_original = (gaze_x_rel_original, gaze_y_rel_original)
+                    
+                    # 检查是否处于屏幕切换适应期
+                    if (hasattr(self, 'screen_switching_adaptation_frames') and 
+                        self.screen_switching_adaptation_frames > 0):
+                        # 在适应期内，返回原始坐标以避免卡尔曼滤波的拖拽效应
+                        gaze_point_rel_original = raw_gaze_point_original
+                        self.screen_switching_adaptation_frames -= 1
+                    else:
+                        # 使用卡尔曼滤波器平滑原始相对坐标
+                        gaze_point_rel_original = self._smooth_gaze_point(raw_gaze_point_original)
+                    
+                    # 传递原始相对坐标给手眼协调机制
+                    self.hand_eye_coordinator._process_hand_eye_coordination(gaze_point_rel_original, previous_gaze_point)
                     
                     # 更新前一注视点
                     previous_gaze_point = current_gaze_point_rel

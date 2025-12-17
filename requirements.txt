@@ -22,6 +22,7 @@ pygame>=2.0.0                      # 游戏开发库(用于校准界面)
 keyboard>=0.13.5                   # 键盘输入处理
 pywin32>=227; sys_platform == "win32"  # Windows API绑定
 screeninfo>=0.6.0                  # 屏幕信息获取
+uiautomation>=2.0.4                # Windows UI自动化库(用于UI元素检测)
 
 # ==============================================
 # 数据处理与可视化

@@ -32,30 +32,7 @@ class HomTransform:
             self.width = custom_width
             self.height = custom_height
             # 尝试获取对应显示器的物理尺寸
-            try:
-                from screeninfo import get_monitors
-                monitors = get_monitors()
-                # 找到最接近的显示器
-                min_distance = float('inf')
-                target_monitor = None
-                for monitor in monitors:
-                    # 计算分辨率差的平方和作为距离
-                    distance = (monitor.width - custom_width)**2 + (monitor.height - custom_height)**2
-                    if distance < min_distance:
-                        min_distance = distance
-                        target_monitor = monitor
-                if target_monitor:
-                    self.width_mm = target_monitor.width_mm
-                    self.height_mm = target_monitor.height_mm
-                else:
-                    # 如果找不到匹配的显示器，使用默认值
-                    self.width_mm = 521  # 2560x1440显示器的典型宽度（mm）
-                    self.height_mm = 293  # 2560x1440显示器的典型高度（mm）
-            except:
-                # 如果screeninfo不可用，使用默认值
-                self.width_mm = 521
-                self.height_mm = 293
-            # print(f"使用自定义屏幕尺寸: {self.width}x{self.height}, 物理尺寸: {self.width_mm}mmx{self.height_mm}mm")
+            self.width_mm, self.height_mm = self._get_monitor_physical_size(custom_width, custom_height)
         else:
             # 使用默认的屏幕尺寸获取方法
             self.width, self.height, self.width_mm, self.height_mm = getScreenSize()
@@ -78,6 +55,76 @@ class HomTransform:
         self.StW = None  # 世界坐标变换矩阵列表，初始化为None
         self.SetVal = None  # 校准点值，初始化为None
         self.gaze = None  # 注视数据，初始化为None
+    
+    def _get_monitor_physical_size(self, target_width, target_height):
+        """
+        获取指定分辨率显示器的物理尺寸，添加重试机制和错误处理
+        
+        Args:
+            target_width: 目标显示器宽度（像素）
+            target_height: 目标显示器高度（像素）
+            
+        Returns:
+            tuple: (width_mm, height_mm) 物理尺寸
+        """
+        import time
+        
+        max_retries = 3
+        retry_delay = 0.1  # 100ms延迟
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"尝试获取显示器物理尺寸 (第 {attempt + 1} 次)...")
+                from screeninfo import get_monitors
+                monitors = get_monitors()
+                
+                if not monitors:
+                    print(f"未检测到任何显示器，重试中...")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise Exception("无法检测到任何显示器")
+                
+                # 找到最接近的显示器
+                min_distance = float('inf')
+                target_monitor = None
+                for monitor in monitors:
+                    # 计算分辨率差的平方和作为距离
+                    distance = (monitor.width - target_width)**2 + (monitor.height - target_height)**2
+                    if distance < min_distance:
+                        min_distance = distance
+                        target_monitor = monitor
+                
+                if target_monitor:
+                    width_mm = target_monitor.width_mm
+                    height_mm = target_monitor.height_mm
+                    
+                    print(f"[物理尺寸] 原始数据: 显示器 {target_monitor.width}x{target_monitor.height}, 物理尺寸: {width_mm}mmx{height_mm}mm")
+                    
+                    # 特殊情况：1920x1080 副屏硬编码为24寸显示器尺寸
+                    if target_width == 1920 and target_height == 1080:
+                        print(f"[物理尺寸] 检测到1080p副屏，使用硬编码24寸屏幕尺寸")
+                        width_mm = 531  # 24寸显示器标准宽度
+                        height_mm = 299  # 24寸显示器标准高度
+                    
+                    # 验证物理尺寸数据
+                    if width_mm is None or height_mm is None or width_mm <= 0 or height_mm <= 0:
+                        raise Exception(f"无法获取有效物理尺寸: width_mm={width_mm}, height_mm={height_mm}")
+                    
+                    print(f"成功获取显示器物理尺寸: {target_width}x{target_height} -> {width_mm}mmx{height_mm}mm")
+                    return width_mm, height_mm
+                else:
+                    raise Exception("未找到匹配的显示器")
+                    
+            except Exception as e:
+                print(f"获取显示器物理尺寸失败 (第 {attempt + 1} 次): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    print("所有重试均失败，抛出异常")
+                    raise e
 
     def RecordGaze(self, model, cap, sfm=False):
         df = pd.DataFrame()
@@ -358,7 +405,7 @@ class HomTransform:
             # 获取当前校准点
             idx, SetPos = calib_targets.getTargetCalibration(calib_time_per_point)
             if idx is None:
-                print("校准完成！")
+                print("校准完成2！")
                 break
             
             # 显示校准点
@@ -415,9 +462,11 @@ class HomTransform:
         
         # 清理Pygame资源
         calib_ui.cleanup()
-        
+        print("开始处理校准数据:")
+        print("self.df111111:", self.df)
         # 保存校准数据
         self.df.columns = ['Timestamp', 'idx', 'gaze_x', 'gaze_y', 'gaze_z', 'REyePos_x', 'REyePos_y', 'LEyePos_x', 'LEyePos_y', 'yaw', 'pitch', 'roll', 'HeadBox_xmin', 'HeadBox_ymin', 'RightEyeBox_xmin', 'RightEyeBox_ymin', 'LeftEyeBox_xmin', 'LeftEyeBox_ymin', 'ROpenClose', 'LOpenClose', 'set_x', 'set_y', 'set_z'] + 16 * ['WTransG']
+        print("self.df:", self.df)
         self.df = self.df.reset_index(drop=True)
         self.df.to_csv(os.path.join(self.dir, "results", "Calibration.csv"))
         
@@ -432,8 +481,8 @@ class HomTransform:
         Sg, SgCalib = self._getCalibValuesOnScreen(g, STransG)
         
         # 绘制结果
-        self._PlotGaze2D(g, Sg, SgCalib, name="GazeOnScreen")
-        self._WriteStatsInFile(STransG)
+        # self._PlotGaze2D(g, Sg, SgCalib, name="GazeOnScreen")
+        # self._WriteStatsInFile(STransG)
         
         # 保存校准结果
         self._save_calibration_results(STransG, g, SetVal, gaze, sfm, STransW if sfm else None, scaleWtG if sfm else None, filename)
@@ -533,6 +582,19 @@ class HomTransform:
             self.StG = [np.array(stg) for stg in calibration_data['transformation_matrices']['StG']]
             self.SetValues = [np.array(setval) for setval in calibration_data['calibration_points']['SetValues']]
             
+            # 恢复屏幕尺寸和物理尺寸信息
+            self.width = calibration_data['device_info']['screen_width']
+            self.height = calibration_data['device_info']['screen_height']
+            
+            # 恢复物理尺寸（如果存在）
+            if 'screen_width_mm' in calibration_data['device_info'] and 'screen_height_mm' in calibration_data['device_info']:
+                self.width_mm = calibration_data['device_info']['screen_width_mm']
+                self.height_mm = calibration_data['device_info']['screen_height_mm']
+            else:
+                # 如果校准数据中没有物理尺寸，使用默认值
+                self.width_mm = 521
+                self.height_mm = 293
+            
             # 恢复SfM相关数据（如果存在）
             if calibration_data['calibration_parameters']['sfm_enabled'] and 'sfm_data' in calibration_data:
                 self.STransW = np.array(calibration_data['sfm_data']['STransW'])
@@ -540,7 +602,8 @@ class HomTransform:
                 self.StW = [np.array(stw) for stw in calibration_data['sfm_data']['StW']]
             
             print(f"校准结果已从 {file_path} 加载")
-            print(f"屏幕尺寸: {calibration_data['device_info']['screen_width']}x{calibration_data['device_info']['screen_height']}")
+            print(f"屏幕尺寸: {self.width}x{self.height}")
+            print(f"物理尺寸: {self.width_mm}mmx{self.height_mm}mm")
             print(f"校准点数: {calibration_data['calibration_parameters']['total_calibration_points']}")
             print(f"SfM启用: {calibration_data['calibration_parameters']['sfm_enabled']}")
             

@@ -743,30 +743,115 @@ class InteractionOverlay(QWidget):
         self.current_gaze_point = current_gaze_point
         self.show_gaze_point = show_gaze_point  # 控制是否显示注视点
         self.fade_circles = []  # 存储所有渐变圆圈
+        self.ui_rectangles = []  # 存储检测到的UI矩形框
         self.setup_overlay()
+    
+    def add_ui_rectangle(self, rect, duration=2000):
+        """添加UI矩形框到覆盖层"""
+        # rect格式: (x, y, width, height) 或 BoundingRectangle对象
+        if hasattr(rect, 'left') and hasattr(rect, 'top') and hasattr(rect, 'right') and hasattr(rect, 'bottom'):
+            # 处理uiautomation矩形对象
+            x = rect.left
+            y = rect.top
+            width = rect.right - rect.left
+            height = rect.bottom - rect.top
+        else:
+            # 处理(x, y, width, height)格式
+            x, y, width, height = rect
+        
+        ui_rect = {
+            'rect': (x, y, width, height),
+            'start_time': time.time() * 1000,
+            'duration': duration
+        }
+        self.ui_rectangles.append(ui_rect)
+        self.update()
+    
+    def update_ui_rectangles(self):
+        """更新UI矩形框，移除过期的矩形"""
+        current_time = time.time() * 1000
+        # 过滤掉过期的矩形
+        self.ui_rectangles = [
+            rect for rect in self.ui_rectangles 
+            if current_time - rect['start_time'] < rect['duration']
+        ]
+    
+    def draw_ui_rectangles(self, painter):
+        """绘制UI矩形框"""
+        # 更新UI矩形列表
+        self.update_ui_rectangles()
+        
+        for ui_rect in self.ui_rectangles:
+            x, y, width, height = ui_rect['rect']
+            
+            # 计算透明度（随时间衰减）
+            current_time = time.time() * 1000
+            elapsed_time = current_time - ui_rect['start_time']
+            opacity = max(0, 255 - (elapsed_time / ui_rect['duration']) * 255)
+            
+            # 绘制UI矩形框（蓝色边框，半透明填充）
+            painter.setBrush(QBrush(QColor(0, 100, 255, int(opacity * 0.3))))  # 半透明蓝色填充
+            painter.setPen(QPen(QColor(0, 150, 255, int(opacity)), 2))  # 蓝色边框
+            painter.drawRect(x, y, width, height)
+            
+            # 在矩形中心绘制小点
+            center_x = x + width // 2
+            center_y = y + height // 2
+            painter.setBrush(QBrush(QColor(255, 255, 0, int(opacity))))  # 黄色点
+            painter.setPen(QPen(QColor(255, 255, 0, int(opacity)), 1))
+            painter.drawEllipse(QPoint(center_x, center_y), 3, 3)
         
     def setup_overlay(self):
         """设置覆盖层"""
-        # 获取屏幕尺寸
-        screen = QApplication.primaryScreen()
-        screen_geometry = screen.geometry()
-        
         # 设置窗口属性
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | 
+            Qt.Tool | 
+            Qt.WindowStaysOnTopHint | 
+            Qt.WindowTransparentForInput | 
+            Qt.WindowDoesNotAcceptFocus 
+        )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setAttribute(Qt.WA_X11DoNotAcceptFocus)  # 不接受焦点
-        self.setAttribute(Qt.WA_X11NetWmWindowTypeDesktop)  # 桌面窗口类型
-        
-        # 设置全屏大小
-        self.setGeometry(screen_geometry)
+
+        # 覆盖整个虚拟桌面
+        self._cover_virtual_desktop()
+        # 让窗口对UIA不可见
+        self._make_uia_invisible()
         
         # 确保窗口不会拦截任何事件
         self.setMouseTracking(False)
         
         # 安装事件过滤器确保鼠标事件被传递
         self.installEventFilter(self)
+    
+    def _cover_virtual_desktop(self):
+        """覆盖整个虚拟桌面"""
+        desktop = QApplication.desktop()
+        rect = desktop.geometry()  # 整个虚拟桌面
+        self.setGeometry(rect)
+        self.show()
+
+    def _make_uia_invisible(self):
+        """
+        使用win32 API设置窗口样式，让窗口对UIA不可见
+        这样UIAutomation就能检测到下面的应用UI元素，而不是透明交互层
+        """
+        try:
+            import win32con
+            import win32gui
+            
+            hwnd = self.winId()
+            style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            style |= (
+                win32con.WS_EX_LAYERED |
+                win32con.WS_EX_TRANSPARENT |  # 输入与命中都透明
+                win32con.WS_EX_TOOLWINDOW |   # 不计入正常窗口层级
+                win32con.WS_EX_NOACTIVATE     # UIA 会忽略它
+            )
+            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, style)
+        except Exception as e:
+            print(f"[DEBUG] 设置UIA不可见失败: {e}")
         
     def update_gaze_point(self, gaze_point):
         """更新注视点位置"""
@@ -778,6 +863,9 @@ class InteractionOverlay(QWidget):
         """绘制交互区域和注视点"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        
+        # 绘制UI矩形框
+        self.draw_ui_rectangles(painter)
         
         # 更新并绘制所有渐变圆圈
         self.update_fade_circles(painter)
@@ -867,3 +955,20 @@ class InteractionOverlay(QWidget):
         """防止闪烁的更新方法"""
         # 不调用update()，避免闪烁
         pass
+    
+    def update_ui_controls(self, ui_controls):
+        """
+        更新UI控件列表
+        
+        Args:
+            ui_controls: UI控件矩形列表，每个元素为 (left, top, width, height) 绝对坐标
+        """
+        # 清空现有列表
+        self.ui_rectangles.clear()
+        
+        # 添加新的UI控件矩形
+        for rect in ui_controls:
+            self.add_ui_rectangle(rect)
+        
+        # 重绘界面
+        self.update()

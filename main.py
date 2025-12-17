@@ -70,7 +70,7 @@ def main():
     if system.cap:
         system.cap.release()
     
-    # 退出应用程序，不再等待Qt事件循环
+    # 退出应用程序，不再等待Qt事件循环 
     sys.exit(0)
 
 if __name__ == "__main__":

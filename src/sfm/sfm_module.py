@@ -19,6 +19,12 @@ from sfm.linear_triangulation import linearTriangulation
 from sfm.draw_camera import drawCamera
 # from sfm.utils import invHomMatrix, fit_plane, rotation_matrix_to_align_plane
 import utilities.utils as util
+plt.rcParams['font.sans-serif'] = [
+    # Windows 优先
+    'SimHei', 'Microsoft YaHei',
+]
+# 修复负号显示为方块的问题
+plt.rcParams['axes.unicode_minus'] = False
 plt.rcParams['font.family'] = 'SimHei' 
 
 class SFM():
@@ -160,7 +166,9 @@ class SFM():
         video_path = os.path.join(self.dir, video_path)
         cap = cv2.VideoCapture(video_path)
 
-        out_video,_,_ = gcv.get_out_video(cap, os.path.join(self.dir, "results"), file_name = "eye_features.mp4", scalewidth=2)
+        # 使用 get_out_video 函数来创建输出视频
+        from gaze_tracking.calibration_pygame import get_out_video
+        out_video,_,_ = get_out_video(cap, os.path.join(self.dir, "results"), file_name = "eye_features.mp4", scalewidth=2)
 
         frame = None
         # frame_prev = self.average_frame
@@ -183,19 +191,36 @@ class SFM():
                 break
 
             if frame_prev is not None:
-                # W_P is defined in previous frame
-                # W_T_G1, W_T_G2, W_P = self.get_GazeToWorld(model, frame, frame_prev)
-                W_T_G1, W_T_G2, W_P = self.get_GazeToWorld(model, frame_prev, frame)
+                # 预计算人脸特征点并更新缓存（与RunGazeOnScreen保持一致）
+                face_features_prev = model.get_FaceFeatures(frame_prev)
+                face_features_curr = model.get_FaceFeatures(frame)
+                
+                # 更新缓存
+                self.update_caches(frame_prev_features=face_features_prev, frame_curr_features=face_features_curr)
+                
+                # 使用缓存进行SfM处理
+                W_T_G1, W_T_G2, W_P = self.get_GazeToWorld(model, frame_prev, frame, 
+                                                          face_features_prev=face_features_prev, 
+                                                          face_features_curr=face_features_curr)
                 timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
                 df = pd.concat([ df, pd.DataFrame([np.hstack((timestamp, W_P.flatten(), np.median(W_P, axis=0))) ]) ])
                 dfT = pd.concat([ dfT, pd.DataFrame(W_T_G1) ])
 
                 ax = fig.add_subplot(111, projection='3d')
-                ax.scatter(W_P[:,0], W_P[:,1], W_P[:,2], marker = 'o')
-                drawCamera(ax, W_T_G1[:3,3], W_T_G1[:3,:3], length_scale = 0.1)
+                # 修复坐标轴：交换x和y轴，使显示更自然
+                ax.scatter(W_P[:,1], W_P[:,2], W_P[:,0], marker = 'o')
+                # 交换相机位置和方向矩阵坐标（x和y交换）
+                camera_pos = np.array([W_T_G1[1,3], W_T_G1[2,3], W_T_G1[0,3]])
+                camera_dir = np.array([[W_T_G1[1,0], W_T_G1[1,1], W_T_G1[1,2]], 
+                                      [W_T_G1[2,0], W_T_G1[2,1], W_T_G1[2,2]], 
+                                      [W_T_G1[0,0], W_T_G1[0,1], W_T_G1[0,2]]])
+                drawCamera(ax, camera_pos, camera_dir, length_scale = 0.1)
                 # drawCamera(ax, W_T_G2[:3,3], W_T_G2[:3,:3], length_scale = 0.1)
                 drawCamera(ax, np.zeros(3), np.eye(3), length_scale = 0.1)
                 ax.text(-0.1,-0.1,-0.1,"W")
+                ax.set_xlabel('Y')
+                ax.set_ylabel('Z') 
+                ax.set_zlabel('X')
                 # ax.view_init(elev=80, azim=0)
                             
                 plots.append([ax])
@@ -235,9 +260,9 @@ class SFM():
             # draw_frame = frame_prev.copy()
             draw_frame = frame.copy()
             p1 = model.get_FaceFeatures(draw_frame)
-            # for idx, p in enumerate(p1.T):
-            #     cv2.drawMarker(draw_frame, tuple(p.astype(int)[0:2].flatten()), color=(255,0,0), markerType=cv2.MARKER_CROSS, thickness=2)
-            #     cv2.putText(draw_frame, str(idx), tuple(p.astype(int)[0:2].flatten()), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            for idx, p in enumerate(p1.T):
+                cv2.drawMarker(draw_frame, tuple(p.astype(int)[0:2].flatten()), color=(255,0,0), markerType=cv2.MARKER_CROSS, thickness=2)
+                cv2.putText(draw_frame, str(idx), tuple(p.astype(int)[0:2].flatten()), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
 
             if out_video is not None:      
@@ -250,7 +275,10 @@ class SFM():
         cap.release()
         cv2.destroyAllWindows()
         ani = animation.ArtistAnimation(fig, plots)
-        ani.save(os.path.join(self.dir, "results", 'animation.mp4'), writer='ffmpeg')
+        # 修复动画时长：设置正确的fps匹配原视频
+        Writer = animation.writers['ffmpeg']
+        writer = Writer(fps=30, metadata=dict(artist='Me'), bitrate=1800)
+        ani.save(os.path.join(self.dir, "results", 'animation.mp4'), writer=writer)
         
         df.columns = ['timestamp(hh:m:s.ms)'] + ['W_Px', 'W_Py', 'W_Pz']*W_P.shape[0] + ['W_Px_mean', 'W_Py_mean', 'W_Pz_mean']
         df = df.reset_index(drop=True)

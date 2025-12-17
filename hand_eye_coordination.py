@@ -37,6 +37,33 @@ import win32api
 import win32con
 import ctypes
 from ctypes import wintypes
+import uiautomation as auto
+
+# ---------- UI控件检测相关常量和函数 ----------
+# 跳过文字/图标类型
+SKIP_TYPES = {
+    "TextControl",
+    "ImageControl",
+    "GlyphControl",
+    "ListControl"
+}
+
+def find_non_leaf_control(ctrl):
+    """
+    如果鼠标命中了文字、图标，向上爬找到真正的 UI 容器控件
+    （例如按钮、面板、菜单项等）
+    
+    Args:
+        ctrl: 原始UI控件
+        
+    Returns:
+        真正的UI容器控件，如果未找到则返回None
+    """
+    while ctrl:
+        if ctrl.ControlTypeName not in SKIP_TYPES:
+            return ctrl
+        ctrl = ctrl.GetParentControl()
+    return None
 
 class HandEyeCoordinator:
     """手眼协调器，负责处理手眼协调机制、鼠标自动移动"""
@@ -63,6 +90,9 @@ class HandEyeCoordinator:
             raise ValueError(f"threshold_config 中缺少必需的参数: {missing_keys}")
         
         self.threshold_config = threshold_config
+        
+        # 检测到的UI控件信息，用于在UI界面上绘制边框
+        self.detected_ui_controls = []
         
         # 手眼协调机制相关状态变量
         self.hand_eye_coordination_enabled = True  # 手眼协调机制总开关（鼠标右键触发）
@@ -118,6 +148,17 @@ class HandEyeCoordinator:
         """检查空格键是否被按下"""
         return win32api.GetKeyState(win32con.VK_SPACE) < 0
     
+    def _calculate_gaze_center(self):
+        """
+        计算凝视点中心点
+        
+        Returns:
+            tuple: 凝视点中心点坐标 (x, y) 绝对坐标
+        """
+        points = np.array([(x, y) for _, x, y in self.sliding_window_gaze_points])
+        center = np.mean(points, axis=0)
+        return (center[0], center[1])
+    
     def _check_sliding_window_distribution(self):
         """更稳健的滑动窗口视线稳定性判断
         
@@ -152,11 +193,61 @@ class HandEyeCoordinator:
             # ======= 最终判定 =======
             if stable_spatial and stable_time:
                 # 视线稳定，检查鼠标移动
-                self._check_mouse_movement_and_trigger_cursor(center[0], center[1])
+                # 找到中心点所在的屏幕
+                gaze_monitor_index = self.screen_manager.get_target_screen(center[0], center[1])
+                gaze_monitor = self.ui.monitors_info[gaze_monitor_index]
+                
+                # 将绝对坐标转换为目标屏幕的相对坐标
+                rel_x = center[0] - gaze_monitor['x']
+                rel_y = center[1] - gaze_monitor['y']
+                
+                # 检查鼠标移动并触发传送
+                self._check_mouse_movement_and_trigger_cursor(rel_x, rel_y)
                 return True
             return False
         except Exception:
             return False
+    
+    def _detect_ui_control_at_point(self, x, y):
+        """
+        检测指定坐标点的UI控件
+        
+        Args:
+            x: 检测点X坐标（绝对坐标）
+            y: 检测点Y坐标（绝对坐标）
+        
+        Returns:
+            tuple: (UI控件, 边界矩形, 状态)，如果未检测到则返回 (None, None, "")
+        """
+        try:
+            # 将坐标转换为整数
+            x = int(x)
+            y = int(y)
+            
+            raw_ctrl = auto.ControlFromPoint(x, y)
+            if raw_ctrl is None:
+                return None, None, ""
+            
+            ctrl = find_non_leaf_control(raw_ctrl)
+            if ctrl is None:
+                return None, None, ""
+            
+            rect = ctrl.BoundingRectangle
+            if rect is None:
+                return None, None, ""
+            
+            # 检查控件大小是否超过阈值
+            ui_control_max_size = self.threshold_config.get('ui_control_max_size', 350)
+            # rect.width 和 rect.height 是方法，需要调用
+            if rect.width() > ui_control_max_size or rect.height() > ui_control_max_size:
+                return ctrl, rect, "无效框（控件太大）"
+            
+            return ctrl, rect, "命中了UI控件"
+        except Exception as e:
+            print(f"[DEBUG] UI控件检测异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None, ""
     
     def _auto_move_mouse_to_gaze(self, x, y, use_abs_coords=False):
         """自动移动鼠标到注视点位置"""
@@ -210,8 +301,8 @@ class HandEyeCoordinator:
         """检查鼠标移动条件并触发光标跳转（改进的方向判断方法）
         
         Args:
-            target_x: 目标注视点X坐标（相对当前屏幕）
-            target_y: 目标注视点Y坐标（相对当前屏幕）
+            target_x: 目标注视点X坐标（相对当前活动屏幕）
+            target_y: 目标注视点Y坐标（相对当前活动屏幕）
         """
         try:
             # 获取当前鼠标位置
@@ -223,9 +314,27 @@ class HandEyeCoordinator:
             
             # 计算当前鼠标与注视点的距离（第三个判定条件）
             # 转换注视点为绝对坐标
+            # 关键修复：使用当前活动屏幕的偏移量计算注视点的绝对坐标
             current_monitor = self.ui.monitors_info[self.screen_manager.current_monitor_index]
+            
+            # 首先使用当前活动屏幕计算注视点的绝对坐标
             gaze_x_abs = target_x + current_monitor['x']
             gaze_y_abs = target_y + current_monitor['y']
+            
+            # 确定注视点实际所在的屏幕
+            gaze_monitor_index = None
+            for i, monitor in enumerate(self.ui.monitors_info):
+                if (monitor['x'] <= gaze_x_abs < monitor['x'] + monitor['width'] and
+                    monitor['y'] <= gaze_y_abs < monitor['y'] + monitor['height']):
+                    gaze_monitor_index = i
+                    break
+            
+            # 如果注视点不在任何已知屏幕内，使用当前活动屏幕
+            if gaze_monitor_index is None:
+                gaze_monitor_index = self.screen_manager.current_monitor_index
+            
+            # 记录注视点所在的屏幕
+            self.gaze_monitor_index = gaze_monitor_index
             
             gaze_cursor_distance = np.sqrt((cursor_x - gaze_x_abs)**2 + (cursor_y - gaze_y_abs)**2)
             
@@ -253,10 +362,10 @@ class HandEyeCoordinator:
                 direction_valid = self._combined_direction_check(
                     cosine_similarity, distance_change, mouse_move_distance)
                 
-                # 检查是否达到所有触发条件：保持300像素最小距离要求
+                # 检查是否达到所有触发条件：降低阈值提高灵敏度
                 mouse_movement_threshold = self.threshold_config.get('mouse_movement_threshold', 200)
                 if (mouse_move_distance >= mouse_movement_threshold and 
-                    gaze_cursor_distance > 400 and  # 保持400像素最小距离要求
+                    gaze_cursor_distance > 300 and  # 降低最小距离要求到300像素
                     direction_valid):
                     print(f"mouse_move_distance: {mouse_move_distance:.2f}, mouse_movement_threshold: {mouse_movement_threshold:.2f}")
                     
@@ -279,6 +388,27 @@ class HandEyeCoordinator:
             import traceback
             traceback.print_exc()
             pass
+    
+    def _generate_scatter_points(self, center_x, center_y, radius, count=8):
+        """
+        生成散布检测点
+        
+        Args:
+            center_x: 圆心X坐标（绝对坐标）
+            center_y: 圆心Y坐标（绝对坐标）
+            radius: 圆半径（像素）
+            count: 生成的检测点数量
+        
+        Returns:
+            list: 检测点列表，每个元素为 (x, y) 绝对坐标
+        """
+        points = []
+        for i in range(count):
+            angle = 2 * np.pi * i / count
+            x = center_x + radius * np.cos(angle)
+            y = center_y + radius * np.sin(angle)
+            points.append((int(x), int(y)))
+        return points
     
     def calculate_cross_screen_distance(self, point1, point2):
         """计算跨屏距离"""
@@ -344,7 +474,7 @@ class HandEyeCoordinator:
         return distance_change
     
     def _combined_direction_check(self, cosine_similarity, distance_change, move_distance):
-        """优化的方向判断：降低阈值减少延迟
+        """优化的方向判断：降低阈值提高灵敏度
         
         Args:
             cosine_similarity: 余弦相似度值
@@ -355,14 +485,13 @@ class HandEyeCoordinator:
             bool: 方向是否有效
         """
         # 余弦相似度阈值：>0.3表示朝注视点方向移动（降低阈值）
-        cosine_threshold = 0.4
+        cosine_threshold = 0.3
         cosine_valid = cosine_similarity > cosine_threshold
         
         # 距离变化阈值：>20像素表示确实在接近（降低阈值）
-        distance_threshold = 40.0
+        distance_threshold = 20.0
         distance_valid = distance_change > distance_threshold
         
-
         # 两个条件都满足时才触发传送
         return cosine_valid and distance_valid
     
@@ -376,7 +505,7 @@ class HandEyeCoordinator:
             move_dy: 鼠标移动Y方向分量
             
         Returns:
-            tuple: 传送目标点 (x, y) 绝对坐标
+            tuple: 传送目标点 (x, y) 绝对坐标，确保在目标屏幕范围内
         """
         # 归一化鼠标移动方向向量
         move_magnitude = np.sqrt(move_dx**2 + move_dy**2)
@@ -391,6 +520,15 @@ class HandEyeCoordinator:
         radius = self.threshold_config.get('teleport_circle_radius', 100)
         teleport_x = center_x - normalized_dx * radius
         teleport_y = center_y - normalized_dy * radius
+        
+        # 确保传送目标位置在目标屏幕范围内
+        # 首先确定注视点所在的屏幕
+        gaze_monitor_index = self.screen_manager.get_target_screen(center_x, center_y)
+        gaze_monitor = self.ui.monitors_info[gaze_monitor_index]
+        
+        # 将传送目标位置限制在目标屏幕范围内
+        teleport_x = max(gaze_monitor['x'], min(teleport_x, gaze_monitor['x'] + gaze_monitor['width'] - 1))
+        teleport_y = max(gaze_monitor['y'], min(teleport_y, gaze_monitor['y'] + gaze_monitor['height'] - 1))
         
         return teleport_x, teleport_y
     
@@ -409,66 +547,134 @@ class HandEyeCoordinator:
             current_cursor_pos = win32api.GetCursorPos()
             cursor_x, cursor_y = current_cursor_pos
             
-            # 使用滑动窗口第一个和最后一个位置计算移动方向和距离
-            if len(self.mouse_movement_window) >= 2:
-                # 使用滑动窗口第一个和最后一个位置
-                first_pos = self.mouse_movement_window[0]  # (timestamp, x, y)
-                last_pos = self.mouse_movement_window[-1]   # (timestamp, x, y)
-                move_dx = last_pos[1] - first_pos[1]  # x坐标差值
-                move_dy = last_pos[2] - first_pos[2]  # y坐标差值
-                move_distance = np.sqrt(move_dx**2 + move_dy**2)  # 滑动窗口总移动距离
-                
-                # 使用滑动窗口移动方向计算传送目标
-                if move_distance > 1e-6:
-                    # 计算圆周传送目标点
-                    target_x, target_y = self._calculate_circular_teleport(
-                        fade_circle_x, fade_circle_y, move_dx, move_dy)
-                else:
-                    # 如果移动距离太小，使用固定偏移
-                    radius = self.threshold_config.get('teleport_circle_radius', 100)
-                    target_x = fade_circle_x - radius
-                    target_y = fade_circle_y
-            else:
-                # 如果滑动窗口数据不足，使用当前鼠标位置与渐变圆圈中心计算方向
-                move_dx = cursor_x - fade_circle_x
-                move_dy = cursor_y - fade_circle_y
-                move_magnitude = np.sqrt(move_dx**2 + move_dy**2)
-                
-                if move_magnitude > 1e-6:
-                    # 归一化方向向量
-                    normalized_dx = move_dx / move_magnitude
-                    normalized_dy = move_dy / move_magnitude
-                    radius = self.threshold_config.get('teleport_circle_radius', 100)
-                    target_x = fade_circle_x - normalized_dx * radius
-                    target_y = fade_circle_y - normalized_dy * radius
-                else:
-                    # 如果距离太小，不执行传送
-                    return
+            # 确定注视点所在的屏幕
+            gaze_monitor_index = self.screen_manager.get_target_screen(fade_circle_x, fade_circle_y)
+            gaze_monitor = self.ui.monitors_info[gaze_monitor_index]
             
-            # 转换目标坐标为当前屏幕的相对坐标
-            target_monitor_index = None
+            # ===== UI辅助跳转点确认功能 =====
+            ui_target_x, ui_target_y = fade_circle_x, fade_circle_y
+            ui_status = "未使用UI辅助"
+            
+            # 检查是否启用了UI辅助跳转功能
+            ui_assisted_jump_enabled = self.threshold_config.get('ui_assisted_jump_enabled', True)
+            print(f"[DEBUG] UI辅助跳转功能: {'已启用' if ui_assisted_jump_enabled else '已禁用'}")
+            print(f"[DEBUG] 滑动窗口点数量: {len(self.sliding_window_gaze_points)}/8")
+            
+            if ui_assisted_jump_enabled and len(self.sliding_window_gaze_points) >= 8:
+                # 计算凝视点中心点
+                gaze_center = self._calculate_gaze_center()
+                print(f"[DEBUG] 凝视点中心点: ({gaze_center[0]:.2f}, {gaze_center[1]:.2f})")
+                
+                # 查找最优的UI目标控件
+                optimal_target, status = self._find_optimal_ui_target(gaze_center)
+                if optimal_target:
+                    ui_target_x, ui_target_y = optimal_target
+                    ui_status = status
+                    print(f"[DEBUG] 找到最优UI目标: ({optimal_target[0]}, {optimal_target[1]}), 状态: {status}")
+                else:
+                    print(f"[DEBUG] 未找到有效UI目标，状态: {status}")
+            
+            # 决定跳转位置
+            if ui_status == "命中了UI控件":
+                # 情况1：初始UI检测命中有效UI控件，跳转到UI中心
+                target_x, target_y = ui_target_x, ui_target_y
+                print(f"[DEBUG] UI辅助跳转: 初始检测命中UI控件，跳转到中心 ({int(target_x)}, {int(target_y)})")
+                
+                # 绿色渐变圆圈也绘制在UI控件中心
+                fade_circle_x = ui_target_x
+                fade_circle_y = ui_target_y
+            elif ui_status == "随机抽的UI框":
+                # 情况2：散布检测找到UI控件，需要跳转到边界位置
+                print(f"[DEBUG] UI辅助跳转: 散布检测找到UI控件，需要跳转到边界位置")
+                
+                # 使用滑动窗口第一个和最后一个位置计算移动方向和距离
+                if len(self.mouse_movement_window) >= 2:
+                    # 使用滑动窗口第一个和最后一个位置
+                    first_pos = self.mouse_movement_window[0]  # (timestamp, x, y)
+                    last_pos = self.mouse_movement_window[-1]   # (timestamp, x, y)
+                    move_dx = last_pos[1] - first_pos[1]  # x坐标差值
+                    move_dy = last_pos[2] - first_pos[2]  # y坐标差值
+                    move_distance = np.sqrt(move_dx**2 + move_dy**2)  # 滑动窗口总移动距离
+                    
+                    # 使用滑动窗口移动方向计算传送目标到UI边界
+                    if move_distance > 1e-6:
+                        # 计算圆周传送目标点
+                        target_x, target_y = self._calculate_circular_teleport(
+                            ui_target_x, ui_target_y, move_dx, move_dy)
+                    else:
+                        # 如果移动距离太小，使用固定偏移
+                        radius = self.threshold_config.get('teleport_circle_radius', 100)
+                        target_x = ui_target_x - radius
+                        target_y = ui_target_y - radius
+                else:
+                    # 如果没有足够的鼠标移动数据，直接使用UI目标坐标
+                    target_x, target_y = ui_target_x, ui_target_y
+                    
+                # 绿色渐变圆圈绘制在UI控件中心
+                fade_circle_x = ui_target_x
+                fade_circle_y = ui_target_y
+            else:
+                # 情况3：未命中UI控件，使用原有默认传送逻辑
+                print(f"[DEBUG] UI辅助跳转: 未命中UI控件，使用默认传送逻辑")
+                # 使用滑动窗口第一个和最后一个位置计算移动方向和距离
+                if len(self.mouse_movement_window) >= 2:
+                    # 使用滑动窗口第一个和最后一个位置
+                    first_pos = self.mouse_movement_window[0]  # (timestamp, x, y)
+                    last_pos = self.mouse_movement_window[-1]   # (timestamp, x, y)
+                    move_dx = last_pos[1] - first_pos[1]  # x坐标差值
+                    move_dy = last_pos[2] - first_pos[2]  # y坐标差值
+                    move_distance = np.sqrt(move_dx**2 + move_dy**2)  # 滑动窗口总移动距离
+                    
+                    # 使用滑动窗口移动方向计算传送目标
+                    if move_distance > 1e-6:
+                        # 计算圆周传送目标点
+                        target_x, target_y = self._calculate_circular_teleport(
+                            ui_target_x, ui_target_y, move_dx, move_dy)
+                    else:
+                        # 如果移动距离太小，使用固定偏移
+                        radius = self.threshold_config.get('teleport_circle_radius', 100)
+                        target_x = ui_target_x - radius
+                        target_y = ui_target_y - radius
+                else:
+                    # 如果没有足够的鼠标移动数据，直接使用原始凝视点中心
+                    target_x, target_y = ui_target_x, ui_target_y
+                    
+                # 绿色渐变圆圈绘制在原始凝视点中心
+                fade_circle_x = ui_target_x
+                fade_circle_y = ui_target_y
+            
+            # 移动鼠标到目标位置（使用绝对坐标）
+            win32api.SetCursorPos((int(target_x), int(target_y)))
+            
+            # 输出UI信息使用的状态
+            print(f"[DEBUG] 跳转目标: ({int(target_x)}, {int(target_y)}), UI状态: {ui_status}")
+            
+            # 确保绿色渐变圆圈的坐标在屏幕内
+            # 找到UI控件所在的显示器
+            target_monitor_index = 0
+            fade_circle_x_clamped = fade_circle_x
+            fade_circle_y_clamped = fade_circle_y
+            
+            # 遍历所有显示器，找到fade_circle所在的显示器
             for i, monitor in enumerate(self.ui.monitors_info):
-                if monitor['x'] <= fade_circle_x < monitor['x'] + monitor['width'] and \
-                   monitor['y'] <= fade_circle_y < monitor['y'] + monitor['height']:
+                if (monitor['x'] <= fade_circle_x < monitor['x'] + monitor['width'] and
+                    monitor['y'] <= fade_circle_y < monitor['y'] + monitor['height']):
                     target_monitor_index = i
                     break
             
-            if target_monitor_index is not None:
-                # 移动鼠标到目标位置（使用绝对坐标）
-                win32api.SetCursorPos((int(target_x), int(target_y)))
-                
-                # 在传送位置添加渐变圆圈效果
-                # 计算相对于目标显示器的坐标
-                monitor = self.ui.monitors_info[target_monitor_index]
-                relative_x = int(fade_circle_x - monitor['x'])
-                relative_y = int(fade_circle_y - monitor['y'])
-                
-                # 在双屏模式下，使用interaction_overlays
-                if self.ui.interaction_overlays and len(self.ui.interaction_overlays) > target_monitor_index:
-                    self.ui.interaction_overlays[target_monitor_index].add_fade_circle(relative_x, relative_y, radius=100, duration=1500)
-                # 兼容单屏模式
-                elif hasattr(self.ui, 'current_widget') and self.ui.current_widget:
-                    self.ui.current_widget.add_fade_circle(int(fade_circle_x), int(fade_circle_y), radius=100, duration=1500)
+            # 获取目标显示器信息
+            target_monitor = self.ui.monitors_info[target_monitor_index]
+            
+            # 计算相对于目标显示器的坐标
+            relative_x = int(fade_circle_x - target_monitor['x'])
+            relative_y = int(fade_circle_y - target_monitor['y'])
+            
+            # 在双屏模式下，使用interaction_overlays
+            if self.ui.interaction_overlays and len(self.ui.interaction_overlays) > target_monitor_index:
+                self.ui.interaction_overlays[target_monitor_index].add_fade_circle(relative_x, relative_y, radius=100, duration=1500)
+            # 兼容单屏模式
+            elif hasattr(self.ui, 'current_widget') and self.ui.current_widget:
+                self.ui.current_widget.add_fade_circle(int(fade_circle_x_clamped), int(fade_circle_y_clamped), radius=100, duration=1500)
             
             # 应用传送后阻尼效果
             self._apply_post_teleport_damping()
@@ -571,6 +777,140 @@ class HandEyeCoordinator:
         import threading
         threading.Thread(target=self.restore_speed_ease_out, args=(self.TARGET_LOW_SPEED,)).start()
     
+    def _update_detected_ui_controls(self, rects):
+        """
+        更新检测到的UI控件列表
+        
+        Args:
+            rects: UI控件矩形列表，每个元素为 (left, top, width, height) 绝对坐标
+        """
+        # 清空现有列表
+        self.detected_ui_controls.clear()
+        
+        # 添加新的UI控件矩形
+        for rect in rects:
+            self.detected_ui_controls.append(rect)
+        
+        # 将UI控件矩形传递给UI组件，用于绘制边框
+        if hasattr(self.ui, 'interaction_overlays') and self.ui.interaction_overlays:
+            # 多屏模式：为每个屏幕准备对应的UI控件列表
+            screen_ui_controls = [[] for _ in range(len(self.ui.interaction_overlays))]
+            
+            for rect in self.detected_ui_controls:
+                left, top, width, height = rect
+                # 计算UI控件的中心点，用于确定所在屏幕
+                center_x = left + width // 2
+                center_y = top + height // 2
+                
+                # 找到UI控件所在的屏幕
+                target_screen_index = None
+                for i, monitor in enumerate(self.ui.monitors_info):
+                    if (monitor['x'] <= center_x < monitor['x'] + monitor['width'] and
+                        monitor['y'] <= center_y < monitor['y'] + monitor['height']):
+                        target_screen_index = i
+                        break
+                
+                if target_screen_index is not None:
+                    # 将绝对坐标转换为目标屏幕的相对坐标
+                    monitor = self.ui.monitors_info[target_screen_index]
+                    rel_left = left - monitor['x']
+                    rel_top = top - monitor['y']
+                    
+                    # 添加到对应屏幕的UI控件列表
+                    screen_ui_controls[target_screen_index].append((rel_left, rel_top, width, height))
+            
+            # 为每个屏幕更新对应的UI控件
+            for i, overlay in enumerate(self.ui.interaction_overlays):
+                overlay.update_ui_controls(screen_ui_controls[i])
+        elif hasattr(self.ui, 'current_widget') and self.ui.current_widget:
+            # 单屏模式：直接传递绝对坐标
+            self.ui.current_widget.update_ui_controls(self.detected_ui_controls)
+    
+    def _find_optimal_ui_target(self, gaze_center):
+        """
+        查找最优的UI目标控件，并返回UI信息使用的状态
+        
+        Args:
+            gaze_center: 凝视点中心点坐标 (x, y) 绝对坐标
+        
+        Returns:
+            tuple: (最优UI控件的中心坐标, UI信息使用的状态)，如果未找到则返回 (None, "")
+        """
+        # 初始化状态变量
+        status = ""
+        optimal_rect = None
+        
+        # 1. 初始UI控件检测
+        x, y = gaze_center
+        print(f"[DEBUG] 初始UI控件检测: 坐标 ({x}, {y})")
+        ctrl, rect, status = self._detect_ui_control_at_point(x, y)
+        if ctrl and rect:
+                print(f"[DEBUG] 初始UI控件检测: 找到控件, 状态: {status}")
+                if status != "无效框（控件太大）":
+                    # 计算UI控件的几何中心
+                    center_x = rect.left + rect.width() // 2
+                    center_y = rect.top + rect.height() // 2
+                    # 设置最优UI控件矩形
+                    optimal_rect = (rect.left, rect.top, rect.width(), rect.height())
+                    # 更新检测到的UI控件
+                    self._update_detected_ui_controls([optimal_rect])
+                    print(f"[DEBUG] 找到UI控件，中心坐标: ({center_x}, {center_y})")
+                    return (center_x, center_y), status
+        else:
+            print(f"[DEBUG] 初始UI控件检测: 未找到有效控件")
+        
+        # 2. 散布检测机制
+        scatter_radius = self.threshold_config.get('scatter_detection_radius', 100)
+        scatter_points = self._generate_scatter_points(x, y, scatter_radius)
+        print(f"[DEBUG] 散布检测机制: 圆心 ({x}, {y}), 半径 {scatter_radius}, 检测点数量 {len(scatter_points)}")
+        
+        valid_controls = []
+        valid_rects = []
+        
+        for i, (px, py) in enumerate(scatter_points):
+            print(f"[DEBUG] 散布检测点 {i+1}: 坐标 ({px}, {py})")
+            ctrl, rect, point_status = self._detect_ui_control_at_point(px, py)
+            if ctrl and rect:
+                print(f"[DEBUG] 散布检测点 {i+1}: 找到控件, 状态: {point_status}")
+                if point_status != "无效框（控件太大）":
+                    # 计算UI控件的几何中心
+                    center_x = rect.left + rect.width() // 2
+                    center_y = rect.top + rect.height() // 2
+                    
+                    # 计算到凝视点中心点的距离
+                    distance = np.sqrt((center_x - x)**2 + (center_y - y)**2)
+                    
+                    valid_controls.append((center_x, center_y, distance, point_status, rect))
+                    valid_rects.append((rect.left, rect.top, rect.width(), rect.height()))
+                    print(f"[DEBUG] 散布检测点 {i+1}: 添加到有效控件列表, 中心坐标 ({center_x}, {center_y}), 距离 {distance:.2f}")
+            else:
+                print(f"[DEBUG] 散布检测点 {i+1}: 未找到有效控件")
+        
+        if valid_controls:
+            # 选择距离最近的UI控件
+            valid_controls.sort(key=lambda x: x[2])
+            optimal_target = valid_controls[0][0], valid_controls[0][1]
+            # 获取最优UI控件的矩形
+            optimal_rect = (valid_controls[0][4].left, valid_controls[0][4].top, 
+                          valid_controls[0][4].width(), valid_controls[0][4].height())
+            # 更新检测到的UI控件，只显示最优的一个
+            self._update_detected_ui_controls([optimal_rect])
+            print(f"[DEBUG] 散布检测机制: 找到 {len(valid_controls)} 个有效控件, 最优目标: ({optimal_target[0]}, {optimal_target[1]})")
+            return optimal_target, "随机抽的UI框"
+        
+        # 3. 无效框处理
+        if status == "无效框（控件太大）":
+            # 显示无效框
+            if rect:
+                invalid_rect = (rect.left, rect.top, rect.width(), rect.height())
+                self._update_detected_ui_controls([invalid_rect])
+            return None, status
+        
+        # 没有找到任何UI控件，清空显示
+        self._update_detected_ui_controls([])
+        print(f"[DEBUG] 所有检测均未找到有效UI控件")
+        return None, ""
+    
     def _process_mouse_movement_triggered_teleport(self, gaze_point):
         """处理鼠标移动触发的传送逻辑主流程
         
@@ -582,10 +922,15 @@ class HandEyeCoordinator:
         
         current_time = time.time() * 1000  # 转换为毫秒
         
-        # 持续收集注视点到滑动窗口（自动维护最多8个点）
-        self.sliding_window_gaze_points.append((current_time, gaze_point[0], gaze_point[1]))
-   
-        # 当滑动窗口收集满8个点时进行检查
+        # 将相对坐标转换为绝对坐标
+        current_monitor = self.ui.monitors_info[self.screen_manager.current_monitor_index]
+        gaze_x_abs = gaze_point[0] + current_monitor['x']
+        gaze_y_abs = gaze_point[1] + current_monitor['y']
+        
+        # 持续收集绝对坐标注视点到滑动窗口（自动维护最多8个点）
+        self.sliding_window_gaze_points.append((current_time, gaze_x_abs, gaze_y_abs))
+        
+        # 当滑动窗口收集满8个点时进行检测
         if len(self.sliding_window_gaze_points) >= 8:
             self._check_sliding_window_distribution()
             # 检查完成后不清空，让滑动窗口继续工作（移除最老点，加入新点）
@@ -597,58 +942,33 @@ class HandEyeCoordinator:
         if not self.hand_eye_coordination_enabled or not self.ui or self.screen_manager.screen_switching:
             return
         
-        # ===== 新增：鼠标移动触发传送逻辑 =====
+        # ===== 新增：鼠标移动触发传送逻辑（完整传送逻辑） =====
         self._process_mouse_movement_triggered_teleport(gaze_point)
         
         # ===== 原有：鼠标右键触发逻辑 =====
         # 检测鼠标右键是否被按下
         right_button_pressed = self.check_right_mouse_button()
         
+        # ===== 冷却时间检查：500ms 内不进行右键交互检测 =====
+        current_time = time.time() * 1000
+        if right_button_pressed and current_time - self.last_auto_mouse_move_time < 500:
+            return
+        
         if right_button_pressed:
             # 使用统一的滑动窗口分布检测进行注视稳定性检查
-            if not self._check_sliding_window_distribution():
-                return  # 如果视线不稳定，不执行后续操作
+            
+            print("右键按下，即将进行跳转！！！！！！！！！！！！！！！！！")
             
             # 获取当前鼠标位置
             try:
                 current_cursor_pos = win32api.GetCursorPos()
                 cursor_x, cursor_y = current_cursor_pos
-                
-                # 多屏环境下的距离计算（仅在真正的多屏模式下）
-                if (len(self.ui.monitors_info) > 1 and is_dual_screen_mode):
-                    # 计算注视点的绝对坐标
-                    gaze_x_abs, gaze_y_abs = self.screen_manager.convert_rel_to_abs_coordinate(
-                        gaze_point[0], gaze_point[1], self.screen_manager.current_monitor_index)
-                    
-                    # 使用跨屏距离计算（传入坐标对而不是单独的x,y值）
-                    gaze_distance = self.calculate_cross_screen_distance(
-                        (gaze_x_abs, gaze_y_abs), (cursor_x, cursor_y))
-                    
-                    # 确定目标屏幕
-                    target_screen = self.screen_manager.get_target_screen(gaze_x_abs, gaze_y_abs)
-                    
-                    # 使用配置中的距离阈值，跨屏模式下可以通过distance_multiplier调整
-                    distance_threshold = self.threshold_config['auto_move_distance'] * self.threshold_config['distance_multiplier']
-                    
-                    # 只有当距离大于阈值时才执行操作
-                    if gaze_distance > distance_threshold:
-                        # 如果需要切换屏幕
-                        if target_screen != self.screen_manager.current_monitor_index:
-                            # 切换到目标屏幕
-                            # 注意：这里需要调用外部的屏幕切换方法
-                            pass
-                        else:
-                            # 如果在同一屏幕内，直接移动鼠标
-                            self._auto_move_mouse_to_gaze(gaze_point[0], gaze_point[1], use_abs_coords=False)
-                    
-                else:
-                    gaze_distance = np.sqrt((gaze_point[0] - cursor_x)**2 + (gaze_point[1] - cursor_y)**2)
-                    
-                    # 如果距离大于阈值，则移动鼠标到注视点
-                    distance_threshold = self.threshold_config['auto_move_distance'] * self.threshold_config['distance_multiplier']
-                    if gaze_distance > distance_threshold:
-                        print(f"Distance: {gaze_distance:.2f}, Threshold: {distance_threshold:.2f}")
-                        self._auto_move_mouse_to_gaze(gaze_point[0], gaze_point[1], use_abs_coords=False)
+                gaze_distance = np.sqrt((gaze_point[0] - cursor_x)**2 + (gaze_point[1] - cursor_y)**2)
+                # 如果距离大于阈值，则移动鼠标到注视点
+                distance_threshold = self.threshold_config['auto_move_distance'] * self.threshold_config['distance_multiplier']
+                if gaze_distance > distance_threshold:
+                    print(f"Distance: {gaze_distance:.2f}, Threshold: {distance_threshold:.2f}")
+                    self._auto_move_mouse_to_gaze(gaze_point[0], gaze_point[1], use_abs_coords=False)
                     
             except Exception:
                 pass
