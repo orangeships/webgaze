@@ -804,7 +804,7 @@ class PygameGazeSystem:
             face_boxes = self.model.face_detection.predict(frame)
             
             # 使用检测到的人脸框调用get_gaze方法
-            eye_info = self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
+            eye_info ,landmarks= self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
             
             gaze_point = None
             if eye_info is not None:

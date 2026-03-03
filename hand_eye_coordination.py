@@ -290,12 +290,12 @@ class HandEyeCoordinator:
             relative_x = display_x - monitor['x']
             relative_y = display_y - monitor['y']
             
-            # 在双屏模式下，使用interaction_overlays
-            if self.ui.interaction_overlays and len(self.ui.interaction_overlays) > target_monitor_index:
-                self.ui.interaction_overlays[target_monitor_index].add_fade_circle(relative_x, relative_y, radius=100, duration=1500)
-            # 兼容单屏模式
-            elif hasattr(self.ui, 'current_widget') and self.ui.current_widget:
-                self.ui.current_widget.add_fade_circle(display_x, display_y, radius=100, duration=1500)
+            # 暂时关闭渐变圆圈显示
+            # if self.ui.interaction_overlays and len(self.ui.interaction_overlays) > target_monitor_index:
+            #     self.ui.interaction_overlays[target_monitor_index].add_fade_circle(relative_x, relative_y, radius=100, duration=1500)
+            # # 兼容单屏模式
+            # elif hasattr(self.ui, 'current_widget') and self.ui.current_widget:
+            #     self.ui.current_widget.add_fade_circle(display_x, display_y, radius=100, duration=1500)
     
     def _check_mouse_movement_and_trigger_cursor(self, target_x, target_y):
         """检查鼠标移动条件并触发光标跳转（改进的方向判断方法）
@@ -669,12 +669,12 @@ class HandEyeCoordinator:
             relative_x = int(fade_circle_x - target_monitor['x'])
             relative_y = int(fade_circle_y - target_monitor['y'])
             
-            # 在双屏模式下，使用interaction_overlays
-            if self.ui.interaction_overlays and len(self.ui.interaction_overlays) > target_monitor_index:
-                self.ui.interaction_overlays[target_monitor_index].add_fade_circle(relative_x, relative_y, radius=100, duration=1500)
-            # 兼容单屏模式
-            elif hasattr(self.ui, 'current_widget') and self.ui.current_widget:
-                self.ui.current_widget.add_fade_circle(int(fade_circle_x_clamped), int(fade_circle_y_clamped), radius=100, duration=1500)
+            # 暂时关闭渐变圆圈显示
+            # if self.ui.interaction_overlays and len(self.ui.interaction_overlays) > target_monitor_index:
+            #     self.ui.interaction_overlays[target_monitor_index].add_fade_circle(relative_x, relative_y, radius=100, duration=1500)
+            # # 兼容单屏模式
+            # elif hasattr(self.ui, 'current_widget') and self.ui.current_widget:
+            #     self.ui.current_widget.add_fade_circle(int(fade_circle_x_clamped), int(fade_circle_y_clamped), radius=100, duration=1500)
             
             # 应用传送后阻尼效果
             self._apply_post_teleport_damping()
@@ -819,12 +819,12 @@ class HandEyeCoordinator:
                     # 添加到对应屏幕的UI控件列表
                     screen_ui_controls[target_screen_index].append((rel_left, rel_top, width, height))
             
-            # 为每个屏幕更新对应的UI控件
-            for i, overlay in enumerate(self.ui.interaction_overlays):
-                overlay.update_ui_controls(screen_ui_controls[i])
-        elif hasattr(self.ui, 'current_widget') and self.ui.current_widget:
-            # 单屏模式：直接传递绝对坐标
-            self.ui.current_widget.update_ui_controls(self.detected_ui_controls)
+            # 暂时关闭UI框显示
+            # for i, overlay in enumerate(self.ui.interaction_overlays):
+            #     overlay.update_ui_controls(screen_ui_controls[i])
+        # elif hasattr(self.ui, 'current_widget') and self.ui.current_widget:
+        #     # 单屏模式：直接传递绝对坐标
+        #     self.ui.current_widget.update_ui_controls(self.detected_ui_controls)
     
     def _find_optimal_ui_target(self, gaze_center):
         """
@@ -935,7 +935,7 @@ class HandEyeCoordinator:
             self._check_sliding_window_distribution()
             # 检查完成后不清空，让滑动窗口继续工作（移除最老点，加入新点）
     
-    def _process_hand_eye_coordination(self, gaze_point, previous_gaze_point, is_dual_screen_mode=False):
+    def _process_hand_eye_coordination(self, gaze_point):
         """处理手眼协调机制 - 基于鼠标右键检测，支持多屏距离计算和自动屏幕切换
         同时支持鼠标移动触发的传送逻辑
         """

@@ -1,5 +1,6 @@
 import os
 import sys
+from tkinter import N
 import cv2
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -11,9 +12,11 @@ import win32api
 import win32con
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(__file__))
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'test'))
 from PyQt5.QtCore import QEventLoop
 from gaze_tracking.homtransform import HomTransform
 from gaze_tracking.model import EyeModel
+from head_pose_estimation import HeadPoseEstimator
 
 # 颜色定义
 WHITE = QColor(255, 255, 255)
@@ -177,6 +180,11 @@ class EyeHandInteractionSystem:
         self.homtrans = None
         self.cap = None
         self.calibration_data = None
+        self.head_pose_estimator = None
+        self.previous_rmat = None  # 保存上一个rmat状态
+        
+        # SfM启用状态
+        self.sfm_enabled = False  # 默认禁用SfM
         
         # 当前交互状态
         self.current_interaction_zone = None
@@ -184,14 +192,28 @@ class EyeHandInteractionSystem:
    
         # 轻量级卡尔曼滤波器初始化（替换自适应移动平均算法）
         self.kalman_filter = LightweightKalmanFilter(
-            process_noise=0.6,     # 过程噪声，进一步提高响应速度
-            measurement_noise=0.2, # 测量噪声，更信任新测量值，平滑更轻微
-            error_estimate=50.0    # 初始误差估计，最大化初始不确定性
+            pn=0.5,     # 过程噪声，进一步提高响应速度
+            mn=0.3,     # 测量噪声，更信任新测量值，平滑更轻微
+            ee=50.0     # 初始误差估计，最大化初始不确定性
         )
         self.smoothing_enabled = True  # 平滑开关
         
+        # 指数平均参数（用于gaze三维数据平滑）
+        self.alpha = 0.5  # 降低平滑因子，减少延迟（从0.8改为0.5）
+        self.previous_gaze_3d = None  # 保存上一次的gaze 3D数据
+        
+        # α-β滤波器参数（用于PnP delta_t平滑）
+        self.alpha_beta_filter_enabled = True  # 是否启用α-β滤波
+        self.alpha_beta_alpha = 0.7  # α参数，控制位置平滑
+        self.beta = 0.3  # β参数，控制速度平滑
+        self.delta_t_filtered = None  # 滤波后的delta_t
+        self.previous_delta_t = None  # 上一帧的delta_t
+        
         # 注视点显示控制相关
         self.show_gaze_point = True  # 是否显示注视点（红色点）
+        
+        # 调试模式
+        self.debug_pnp = False  # 是否输出PnP调试信息
         
         
     def initialize(self):
@@ -204,6 +226,7 @@ class EyeHandInteractionSystem:
         # 初始化模型
         self.model = EyeModel(self.project_dir)
         self.homtrans = HomTransform(self.project_dir)
+        self.head_pose_estimator = HeadPoseEstimator()
         self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
             return False
@@ -250,9 +273,11 @@ class EyeHandInteractionSystem:
             calibration_file = os.path.join(self.project_dir, "results", "calibration_results.json")
             if os.path.exists(calibration_file):
                 print("正在加载历史校准数据...")
-                if self.homtrans.load_calibration_results(calibration_file):
+                
+                if self.homtrans.load_calibration_results(calibration_file, self.sfm_enabled):
                     self.calibration_data = self.homtrans.STransG
                     print("历史校准数据加载成功")
+                    print(f"✓ PnP标定向量: {self.homtrans.calibrate_pnp}")
                     return True
                 else:
                     print("历史校准数据加载失败，将进行新校准")
@@ -267,13 +292,24 @@ class EyeHandInteractionSystem:
     def perform_new_calibration(self):
         """执行新校准"""
         try:
+            calibration_file = os.path.join(self.project_dir, "results", "calibration_results.json")
+            
             STransG = self.homtrans.calibrate(self.model, self.cap, sfm=False)
+            
             if STransG is not None:
+                # 加载校准文件以初始化所有属性（STransG, StG, SetValues等）
+                if self.homtrans.load_calibration_results(calibration_file, self.sfm_enabled):
+                    self.calibration_data = self.homtrans.STransG
+                    print("新校准完成，校准数据已加载")
+                    print(f"✓ PnP标定向量: {self.homtrans.calibrate_pnp}")
+                    return True
+                
                 self.calibration_data = STransG
                 return True
             else:
                 return False
-        except Exception:
+        except Exception as e:
+            print(f"校准失败: {e}")
             return False
     
     def run_interaction_mode(self):
@@ -290,7 +326,6 @@ class EyeHandInteractionSystem:
         
         # 主循环标志
         self.running = True
-        
         # 导入keyboard库用于ESC键和空格键检测
         try:
             import keyboard
@@ -301,10 +336,16 @@ class EyeHandInteractionSystem:
         # 用于防止空格键重复触发的状态变量
         self.space_key_was_pressed = False
         
+        # 用于每隔一秒输出信息的计时变量
+        import time
+        last_print_time = time.time()
+        
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
                 break
+            
+            current_time = time.time()
             
             # 检查ESC键退出（每几帧检查一次以提高性能）
             if keyboard and keyboard.is_pressed('esc'):
@@ -330,39 +371,72 @@ class EyeHandInteractionSystem:
                     # 空格键被释放，允许下次按下时触发
                     self.space_key_was_pressed = False
             
-            # 检测人脸和眼动
-            try:
-                face_boxes = self.model.face_detection.predict(frame)
-                if not face_boxes:  # 如果没有检测到人脸
-                    eye_info = None
-                else:
-                    # 获取眼动信息
-                    try:
-                        eye_info = self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
-                    except Exception:
-                        eye_info = None
-            except Exception:
-                face_boxes = None
-                eye_info = None
+            # 记录单帧处理开始时间
+            frame_start_time = time.time()
             
+            # 检测人脸和眼动并计算注视点（添加用时测量）
+            gaze_processing_start_time = time.time()  # 开始计时
+            
+            try:
+                eye_info ,landmarks, pnp_info = self.model.get_gaze(frame=frame, imshow=False)
+               
+            except Exception:
+                eye_info = None
+              
             if eye_info is not None:
                 gaze = eye_info['gaze']
+                if pnp_info['pnp_tvec'] is not None:
+                    if self.homtrans.calibrate_pnp is None:
+                        self.homtrans.calibrate_pnp = pnp_info['pnp_tvec']
+                    tvec_curr = pnp_info['pnp_tvec']
+               
+                   
+                # 简化指数平均处理gaze三维数据（保持numpy数组格式）
+                if self.previous_gaze_3d is None:
+                    self.previous_gaze_3d = gaze.copy()
+
+                else:
+                    # 简单指数平均：当前值 = α * 新值 + (1-α) * 旧值（使用numpy保持数组格式）
+                    gaze = self.alpha * gaze + (1 - self.alpha) * self.previous_gaze_3d
+                    self.previous_gaze_3d = gaze.copy()
                 
                 # 直接使用单帧注视点估计（关闭SfM功能）
                 try:
-                    FSgaze, Sgaze, Sgaze2 = self.homtrans._getGazeOnScreen(gaze)
+                    if self.homtrans.calibrate_pnp is not None and tvec_curr is not None:
+                        delta_t = tvec_curr - self.homtrans.calibrate_pnp
+                        if self.alpha_beta_filter_enabled:
+                            delta_t_filtered = self._apply_alpha_beta_filter(delta_t)
+                            # 输出调试信息（可选）
+                            delta_t = delta_t_filtered
+                        delta_t=delta_t.flatten()
+                        SRW=[[1,0,0],[0,1,0],[0,0,-1]]
+
+                        delta_t=SRW @ delta_t 
+                        # 注释掉频繁输出
+                        print(f"delta_t:{delta_t}")
+
+                        # StransG: [ 347.85566997  -31.10965641 -678.52976609]
+                        # StransG: [ 333.17223292    7.79619339 -697.11498267]
+                        # 对delta_t进行α-β滤波
+                       
+                        
+                    FSgaze, Sgaze, Sgaze2 = self.homtrans._getGazeOnScreen(gaze, delta_t)
+
                     
-                    # 转换为像素坐标
+                    # 转换为像素坐标系统初始化失败
                     if FSgaze is not None and len(FSgaze) >= 2:
                         screen_pos_mm = FSgaze.flatten()[:2]
                         screen_pos_px = self.homtrans._mm2pixel(screen_pos_mm)
                         
-                        gaze_x = max(0, min(screen_pos_px[0], self.screen_width))
-                        gaze_y = max(0, min(screen_pos_px[1], self.screen_height))
-                    else:
-                        gaze_x = self.screen_width // 2
-                        gaze_y = self.screen_height // 2
-                    
+                        gaze_x = screen_pos_px[0]
+                        gaze_y = screen_pos_px[1]
+
+                      
+
+                    gaze_x = max(0, min(gaze_x, self.screen_width))
+                    gaze_y = max(0, min(gaze_y, self.screen_height))
+
+
                     # 应用轻量级卡尔曼滤波平滑算法
                     raw_gaze_point = (gaze_x, gaze_y)
                     
@@ -372,11 +446,25 @@ class EyeHandInteractionSystem:
                     else:
                         gaze_point = raw_gaze_point
                     
+                    # 计算注视点估计用时并输出
+                    gaze_processing_end_time = time.time()
+                    gaze_processing_time = (gaze_processing_end_time - gaze_processing_start_time) * 1000  # 转换为毫秒
+                    # print(f"单帧注视点估计用时: {gaze_processing_time:.2f}ms")
                     
                     current_gaze_point = gaze_point
 
-                except Exception:
+                except Exception as e:
+                    print(f"Error in gaze processing: {e}")
                     pass
+            
+            # 计算单帧总处理时间
+            frame_end_time = time.time()
+            frame_processing_time = (frame_end_time - frame_start_time) * 1000
+            
+            # 每隔10帧输出一次处理时间
+            if current_time - last_print_time > 1:
+                print(f"单帧总处理时间: {frame_processing_time:.2f}ms, FPS: {1000/frame_processing_time:.1f}")
+                last_print_time = current_time
             
             # 更新交互界面（同时显示注视点和交互区域）
             if self.current_interaction_zone or self.previous_interaction_zone or current_gaze_point:
@@ -388,8 +476,8 @@ class EyeHandInteractionSystem:
                 )
             self.previous_interaction_zone = self.current_interaction_zone
             
-            # 处理Qt事件
-            QApplication.processEvents()
+            # 优化Qt事件处理，减少阻塞
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents | QEventLoop.ExcludeSocketNotifiers)
         
         timer.stop()
         self.ui.close_current_widget()
@@ -400,17 +488,7 @@ class EyeHandInteractionSystem:
     
     
     def _smooth_gaze_point(self, raw_gaze_point):
-        """轻量级卡尔曼滤波注视点平滑算法
-        
-        使用轻量级卡尔曼滤波器实现轻微平滑效果，避免过度滤波导致响应延迟
-        通过优化的参数设置避免过冲现象
-        
-        Args:
-            raw_gaze_point: 原始注视点坐标 (x, y)
-            
-        Returns:
-            平滑后的注视点坐标 (x, y)
-        """
+        """轻量级卡尔曼滤波注视点平滑算法        """
         if not self.smoothing_enabled or not raw_gaze_point:
             return raw_gaze_point
         
@@ -423,6 +501,35 @@ class EyeHandInteractionSystem:
         # 返回平滑后的位置（优化的轻微平滑效果，无过冲）
         smoothed_point = (float(smoothed_position[0]), float(smoothed_position[1]))
         return smoothed_point
+    
+    def _apply_alpha_beta_filter(self, current_delta_t):
+        """对一阶α-β滤波器应用于delta_t进行平滑"""
+        if self.previous_delta_t is None:
+            # 第一次初始化
+            self.delta_t_filtered = current_delta_t.copy()
+            self.previous_delta_t = current_delta_t.copy()
+            return current_delta_t
+        
+        # 计算速度（当前测量值 - 上一次测量值）
+        velocity = current_delta_t - self.previous_delta_t
+        
+        # α-β滤波预测
+        if self.delta_t_filtered is None:
+            predicted_delta_t = current_delta_t
+        else:
+            predicted_delta_t = self.delta_t_filtered + velocity
+        
+        # 更新（校正步骤）
+        measurement_residual = current_delta_t - predicted_delta_t
+        self.delta_t_filtered = predicted_delta_t + self.alpha_beta_alpha * measurement_residual
+        
+        # 更新速度估计
+        velocity_estimate = velocity + self.beta * measurement_residual
+        
+        # 保存当前状态用于下一帧
+        self.previous_delta_t = current_delta_t.copy()
+        
+        return self.delta_t_filtered
 
     def _end_program(self):
         """结束程序"""
@@ -444,113 +551,51 @@ class EyeHandInteractionSystem:
 
 
 class LightweightKalmanFilter:
-    """轻量级卡尔曼滤波器，专门用于注视点平滑
+    """轻量级卡尔曼滤波器，用于注视点平滑"""
     
-    特点：
-    1. 优化的参数配置，自然避免过冲现象
-    2. 平衡平滑效果和响应速度，避免过度滤波导致延迟
-    3. 计算开销低，适合实时应用
-    """
-    
-    def __init__(self, process_noise=0.2, measurement_noise=0.1, error_estimate=50.0):
-        """
-        初始化轻量级卡尔曼滤波器
+    def __init__(self, pn=0.2, mn=0.1, ee=50.0):
+        self.pn = pn  # 过程噪声
+        self.mn = mn  # 测量噪声  
+        self.ee = ee  # 初始误差估计
         
-        Args:
-            process_noise: 过程噪声，决定滤波器对状态变化的敏感度
-            measurement_noise: 测量噪声，决定滤波器对测量误差的鲁棒性
-            error_estimate: 初始误差估计
-        """
-        self.process_noise = process_noise
-        self.measurement_noise = measurement_noise
-        self.error_estimate = error_estimate
-        
-        # 状态向量 [x, y, vx, vy] - 位置和速度
-        self.state = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        
-        # 状态协方差矩阵
-        self.P = np.eye(4, dtype=np.float32) * error_estimate
-        
-        # 状态转移矩阵（假设匀速运动）
-        self.F = np.array([
-            [1, 0, 1, 0],  # x = x + vx
-            [0, 1, 0, 1],  # y = y + vy
-            [0, 0, 1, 0],  # vx = vx
-            [0, 0, 0, 1]   # vy = vy
-        ], dtype=np.float32)
-        
-        # 观测矩阵（只观测位置）
-        self.H = np.array([
-            [1, 0, 0, 0],  # 观测x
-            [0, 1, 0, 0]   # 观测y
-        ], dtype=np.float32)
-        
-        # 过程噪声协方差矩阵
-        self.Q = np.eye(4, dtype=np.float32) * process_noise
-        
-        # 观测噪声协方差矩阵
-        self.R = np.eye(2, dtype=np.float32) * measurement_noise
-        
-        # 初始化标志
+        self.state = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)  # [x, y, vx, vy]
+        self.P = np.eye(4, dtype=np.float32) * ee
+        self.F = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], dtype=np.float32)
+        self.H = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float32)
+        self.Q = np.eye(4, dtype=np.float32) * pn
+        self.R = np.eye(2, dtype=np.float32) * mn
         self.initialized = False
         
     def update(self, measurement):
-        """
-        更新滤波器状态
-        
-        Args:
-            measurement: 观测值 [x, y]
-            
-        Returns:
-            滤波后的状态估计 [x, y, vx, vy]
-        """
+        """更新滤波器状态"""
         measurement = np.array(measurement, dtype=np.float32)
         
         if not self.initialized:
-            # 初始化：设置初始位置，速度为0
-            self.state[0] = measurement[0]  # x
-            self.state[1] = measurement[1]  # y
-            self.state[2] = 0.0  # vx
-            self.state[3] = 0.0  # vy
+            self.state[:2] = measurement  # 设置初始位置
             self.initialized = True
             return self.state.copy()
         
         # 预测步骤
-        # 状态预测: x_pred = F * x
         x_pred = self.F @ self.state
-        
-        # 协方差预测: P_pred = F * P * F^T + Q
         P_pred = self.F @ self.P @ self.F.T + self.Q
         
-        # 更新步骤
-        # 观测预测: z_pred = H * x_pred
+        # 更新步骤  
         z_pred = self.H @ x_pred
-        
-        # 观测残差: y = z - z_pred
         y = measurement - z_pred
-        
-        # 残差协方差: S = H * P_pred * H^T + R
         S = self.H @ P_pred @ self.H.T + self.R
-        
-        # 卡尔曼增益: K = P_pred * H^T * S^(-1)
         K = P_pred @ self.H.T @ np.linalg.inv(S)
         
-        # 状态更新: x = x_pred + K * y
+        # 状态和协方差更新
         self.state = x_pred + K @ y
-        
-        # 协方差更新: P = (I - K * H) * P_pred
-        I = np.eye(4, dtype=np.float32)
-        self.P = (I - K @ self.H) @ P_pred
+        self.P = (np.eye(4) - K @ self.H) @ P_pred
         
         return self.state.copy()
     
     def get_position(self):
-        """获取当前滤波后的位置估计"""
-        return np.array([self.state[0], self.state[1]], dtype=np.float32)
+        """获取滤波后的位置估计"""
+        return self.state[:2].copy()
     
  
-
-
 def main():
     """主函数"""
     app = QApplication(sys.argv)

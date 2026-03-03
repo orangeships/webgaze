@@ -241,6 +241,10 @@ class PygameGazeSystem:
         self.homtrans = None
         self.cap = None
         self.calibration_data = None
+        
+        # SfM启用状态
+        self.sfm_enabled = True  # 默认启用SfM
+        
         # 初始化卡尔曼滤波器用于平滑视线点
         # 参数调整: process_noise越小，滤波越平滑；measurement_noise越小，越信任测量值
         self.kalman_filter = KalmanFilter(process_noise=0.01, measurement_noise=2.0, error_estimate=1.0)
@@ -329,9 +333,11 @@ class PygameGazeSystem:
             calibration_file = os.path.join(self.project_dir, "results", "calibration_results.json")
             if os.path.exists(calibration_file):
                 print(f"正在加载历史校准数据: {calibration_file}")
-                if self.homtrans.load_calibration_results(calibration_file):
+                
+                if self.homtrans.load_calibration_results(calibration_file, self.sfm_enabled):
                     print("历史校准数据加载成功！")
                     self.calibration_data = self.homtrans.STransG
+                    print(f"✓ PnP标定向量: {self.homtrans.calibrate_pnp}")
                     return True
                 else:
                     print("历史校准数据加载失败，将进行新校准")
@@ -441,7 +447,7 @@ class PygameGazeSystem:
             face_boxes = self.model.face_detection.predict(frame)
             
             # 使用检测到的人脸框调用get_gaze方法
-            eye_info = self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
+            eye_info ,landmarks, pnp_info = self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
             
             if eye_info is not None:
                 # 获取3D视线向量

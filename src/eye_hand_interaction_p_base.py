@@ -762,7 +762,7 @@ class EyeHandInteractionSystem:
                 else:
                     # 获取眼动信息
                     try:
-                        eye_info = self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
+                        eye_info ,landmarks= self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
                     except Exception:
                         eye_info = None
             except Exception:

@@ -12,7 +12,7 @@ class FaceMonitor:
             min_tracking_confidence=0.5
         )
         
-        # 50 个面部稳定点 (用于位姿估计 PnP)
+        # 50 个面部稳定点 
         self.stable_indices = [
             1, 2, 4, 5, 6, 8, 9, 10, 151, 168, 193, 197, 454,397, # 中轴线与边缘
             21, 71, 107, 336, 291, 334, 127,58, 93, 132, 361,102,331, # 额头与面颊
@@ -60,7 +60,7 @@ class FaceMonitor:
 
 if __name__ == "__main__":
     monitor = FaceMonitor()
-    cap = cv2.VideoCapture(2)
+    cap = cv2.VideoCapture(1)
     while cap.isOpened():
         success, frame = cap.read()
         if not success: break

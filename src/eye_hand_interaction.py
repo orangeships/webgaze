@@ -714,6 +714,10 @@ class EyeHandInteractionSystem:
         self.homtrans = None
         self.cap = None
         self.calibration_data = None
+        
+        # SfM启用状态
+        self.sfm_enabled = True  # 默认启用SfM
+        
         self.kalman_filter = KalmanFilter(process_noise=0.005, measurement_noise=5.0, error_estimate=2.0)
         self.kalman_enabled = False
         
@@ -850,7 +854,7 @@ class EyeHandInteractionSystem:
             # 首先尝试加载 JSON 格式的主校准文件
             calibration_file = os.path.join(self.project_dir, "results", "calibration_results.json")
             if os.path.exists(calibration_file):
-                if self.homtrans.load_calibration_results(calibration_file):
+                if self.homtrans.load_calibration_results(calibration_file, self.sfm_enabled):
                     self.calibration_data = self.homtrans.STransG
                     return True
                 else:
@@ -859,7 +863,7 @@ class EyeHandInteractionSystem:
                 # 如果没有主校准文件，尝试加载屏幕0的校准文件
                 screen0_file = os.path.join(self.project_dir, "results", "calibration_results_screen_0.json")
                 if os.path.exists(screen0_file):
-                    if self.homtrans.load_calibration_results(screen0_file):
+                    if self.homtrans.load_calibration_results(screen0_file, self.sfm_enabled):
                         self.calibration_data = self.homtrans.STransG
                         return True
                     else:
@@ -915,7 +919,7 @@ class EyeHandInteractionSystem:
                 else:
                     # 获取眼动信息
                     try:
-                        eye_info = self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
+                        eye_info ,landmarks, pnp_info = self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
                     except Exception:
                         eye_info = None
             except Exception:

@@ -52,6 +52,8 @@ from ui_components import EyeHandInteractionUI
 from gaze_analysis import LightweightKalmanFilter, GazeDispersionAnalyzer
 from hand_eye_coordination import HandEyeCoordinator
 from screen_management import ScreenManager
+from gaze_tracking.homtransform import HomTransform
+from gaze_tracking.model import EyeModel
 
 class EyeHandInteractionSystem:
     def __init__(self, project_dir):
@@ -62,6 +64,8 @@ class EyeHandInteractionSystem:
         self.cap = None
         self.calibration_data = None
         
+        # SfM启用状态
+        self.sfm_enabled = False  # 默认启用SfM
         # 双屏支持相关
         self.calibration_mode = "single"  # 校准模式：single 或 multi
         self.is_dual_screen_mode = False  # 标志位，指示是否为双屏模式
@@ -70,6 +74,8 @@ class EyeHandInteractionSystem:
         self.screen_switching = False  # 标志位，防止屏幕切换过程中重复触发
         self.last_gaze_point_abs = None  # 存储上一帧的绝对坐标注视点，用于平滑过渡
         self.screen_switching_adaptation_frames = 0  # 屏幕切换后的卡尔曼滤波适应帧数
+        
+        
         
         # 统一的阈值配置管理器
         self.threshold_config = {
@@ -127,11 +133,9 @@ class EyeHandInteractionSystem:
         self.dispersion_analyzer.set_screen_dimensions(self.ui.screen_width, self.ui.screen_height)
         
         # 初始化模型
-        from gaze_tracking.model import EyeModel
         self.model = EyeModel(self.project_dir)
         
         # 初始化HomTransform（基础实例，稍后应用校准数据）
-        from gaze_tracking.homtransform import HomTransform
         self.homtrans = HomTransform(self.project_dir)
         
         # 初始化屏幕管理器
@@ -139,6 +143,9 @@ class EyeHandInteractionSystem:
         
         # 初始化手眼协调器
         self.hand_eye_coordinator = HandEyeCoordinator(self.ui, self.screen_manager, self.threshold_config)
+
+        # 将注视点分析器切换为绝对坐标基准
+        self._configure_absolute_dispersion()
         
         # 初始化摄像头
         self.cap = None
@@ -162,8 +169,8 @@ class EyeHandInteractionSystem:
             return False
             
         self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 960)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
         return True
     
@@ -174,35 +181,29 @@ class EyeHandInteractionSystem:
             return False
             
         try:
-            # 设置屏幕切换标志
+            # 设置屏幕切换标志并保存当前状态
             self.screen_switching = True
-            
-            # 保存当前状态
             last_gaze_point = self.last_gaze_point_abs
             
-            # 切换显示器
-            if self.screen_manager.switch_to_monitor(target_screen, self.homtrans, self.dispersion_analyzer):
-                # 重新初始化卡尔曼滤波器以适应新屏幕
+            # 切换显示器 - 使用带坐标更新的方法
+            if self.screen_manager.switch_to_monitor_with_coordinate_update(target_screen, self.homtrans, self.dispersion_analyzer, self.kalman_filter):
+                # 重新初始化卡尔曼滤波器以适应新屏幕并更新坐标转换
                 self.kalman_filter = LightweightKalmanFilter(
                     process_noise=0.8,  # 增加过程噪声，加速适应新屏幕
                     measurement_noise=0.4,  # 增加测量噪声，减少拖拽效应
                     error_estimate=2.0  # 增加初始误差估计
                 )
-                # 设置屏幕切换标志，短期内禁用平滑以快速适应新坐标
                 self.screen_switching_adaptation_frames = 5  # 屏幕切换后5帧内快速适应
-                print(f"[DEBUG] 屏幕切换到{target_screen}，卡尔曼滤波器已重置，将快速适应新坐标")
+                
+                # 切换后重新配置屏幕边界与绝对坐标分析基准
+                target_monitor = self.ui.monitors_info[target_screen]
+                self._configure_absolute_dispersion()
                 
                 # 如果有上一帧注视点，将其转换为新屏幕的坐标
                 if last_gaze_point:
-                    # 将绝对坐标转换为新屏幕的相对坐标
-                    new_gaze_x = last_gaze_point[0] - self.ui.monitors_info[target_screen]['x']
-                    new_gaze_y = last_gaze_point[1] - self.ui.monitors_info[target_screen]['y']
-                    
-                    # 更新离散度分析器的屏幕尺寸
-                    self.dispersion_analyzer.set_screen_dimensions(
-                        self.ui.monitors_info[target_screen]['width'],
-                        self.ui.monitors_info[target_screen]['height']
-                    )
+                    new_gaze_x = last_gaze_point[0] - target_monitor['x']
+                    new_gaze_y = last_gaze_point[1] - target_monitor['y']
+                    print(f"[DEBUG] 屏幕切换到{target_screen}，卡尔曼滤波器已重置，将快速适应新坐标")
                 
                 self.screen_switching = False
                 return True
@@ -220,6 +221,108 @@ class EyeHandInteractionSystem:
     def _smooth_gaze_point(self, raw_gaze_point):
         """使用卡尔曼滤波平滑注视点"""
         return self.kalman_filter.update(raw_gaze_point)
+
+    def _configure_absolute_dispersion(self):
+        """
+        将注视点分析器切换为绝对坐标体系。
+        统一记录桌面原点和范围，便于后续做距离计算和坐标归一化。
+        """
+        if not self.ui or not getattr(self.ui, "monitors_info", None):
+            return
+
+        xs = [m['x'] for m in self.ui.monitors_info]
+        ys = [m['y'] for m in self.ui.monitors_info]
+        rights = [m['x'] + m['width'] for m in self.ui.monitors_info]
+        bottoms = [m['y'] + m['height'] for m in self.ui.monitors_info]
+
+        min_x, min_y = min(xs), min(ys)
+        max_x, max_y = max(rights), max(bottoms)
+
+        self.desktop_origin = (min_x, min_y)
+        self.desktop_size = (max_x - min_x, max_y - min_y)
+        self.dispersion_analyzer.set_screen_dimensions(self.desktop_size[0], self.desktop_size[1])
+
+    def _convert_rel_to_abs(self, rel_point, monitor):
+        """将当前屏幕的相对坐标转成绝对坐标"""
+        return (int(rel_point[0] + monitor['x']), int(rel_point[1] + monitor['y']))
+
+    def _convert_abs_to_rel(self, abs_point, monitor):
+        """将绝对坐标转换回指定屏幕的相对坐标"""
+        return (abs_point[0] - monitor['x'], abs_point[1] - monitor['y'])
+
+    def _clamp_relative_to_monitor(self, rel_point, monitor):
+        """约束相对坐标在屏幕内，避免视觉元素溢出"""
+        clamped_x = max(0, min(int(rel_point[0]), monitor['width'] - 1))
+        clamped_y = max(0, min(int(rel_point[1]), monitor['height'] - 1))
+        return clamped_x, clamped_y
+
+    def _smooth_absolute_point(self, abs_point):
+        """
+        在绝对坐标系下做平滑。
+        屏幕切换适配帧内跳过滤波，避免卡尔曼状态拖拽。
+        """
+        if getattr(self, "screen_switching_adaptation_frames", 0) > 0:
+            self.screen_switching_adaptation_frames -= 1
+            return abs_point
+        return self._smooth_gaze_point(abs_point)
+
+    def _is_near_screen_edge(self, abs_point, monitor, threshold=5):
+        """检查绝对坐标距离当前屏幕边界是否在阈值内"""
+        left = monitor['x']
+        right = monitor['x'] + monitor['width']
+        top = monitor['y']
+        bottom = monitor['y'] + monitor['height']
+        return (
+            abs_point[0] - left < threshold or
+            right - abs_point[0] < threshold or
+            abs_point[1] - top < threshold or
+            bottom - abs_point[1] < threshold
+        )
+
+    def _resolve_target_screen_from_point(self, abs_point, monitor, threshold=5):
+        """
+        在接近边界时根据绝对坐标推断目标屏幕。
+        优先用当前位置判定，若仍在当前屏幕则沿最近边界外推1像素再次判定。
+        """
+        if len(self.ui.monitors_info) <= 1:
+            return None
+
+        direct_target = self.screen_manager.get_target_screen(abs_point[0], abs_point[1])
+        if direct_target != self.screen_manager.current_monitor_index:
+            return direct_target
+
+        distances = {
+            "left": abs_point[0] - monitor['x'],
+            "right": monitor['x'] + monitor['width'] - abs_point[0],
+            "top": abs_point[1] - monitor['y'],
+            "bottom": monitor['y'] + monitor['height'] - abs_point[1]
+        }
+        nearest_edge = min(distances, key=distances.get)
+        projected_point = list(abs_point)
+        if nearest_edge == "left":
+            projected_point[0] = monitor['x'] - 1
+        elif nearest_edge == "right":
+            projected_point[0] = monitor['x'] + monitor['width'] + 1
+        elif nearest_edge == "top":
+            projected_point[1] = monitor['y'] - 1
+        elif nearest_edge == "bottom":
+            projected_point[1] = monitor['y'] + monitor['height'] + 1
+
+        projected_target = self.screen_manager.get_target_screen(projected_point[0], projected_point[1])
+        if projected_target != self.screen_manager.current_monitor_index:
+            return projected_target
+        return None
+
+    def _add_absolute_gaze_to_analyzer(self, abs_point):
+        """
+        将绝对坐标的注视点送入离散度分析器。
+        统一以桌面原点为基准做偏移，保证计算基于绝对坐标系。
+        """
+        if not abs_point or not hasattr(self, "desktop_origin") or not hasattr(self, "desktop_size"):
+            return
+        normalized_x = abs_point[0] - self.desktop_origin[0]
+        normalized_y = abs_point[1] - self.desktop_origin[1]
+        self.dispersion_analyzer.add_gaze_point(normalized_x, normalized_y)
     
     def show_menu(self):
         """显示主菜单"""
@@ -336,7 +439,7 @@ class EyeHandInteractionSystem:
                 if self.hand_eye_coordinator.check_escape_key():
                     return False
                 
-                STransG = self.homtrans.calibrate(self.model, self.cap, sfm=True)
+                STransG = self.homtrans.calibrate(self.model, self.cap, sfm=False)
                 if STransG is not None:
                     self.calibration_data = STransG
                     return True
@@ -359,12 +462,15 @@ class EyeHandInteractionSystem:
                     # 如果主显示器没有校准数据，选择第一个有校准数据的显示器
                     monitor_index = next(iter(self.screen_manager.calibration_results.keys()))
                 
-                # 切换到目标显示器，应用校准数据
-                if self.screen_manager.switch_to_monitor(monitor_index, self.homtrans, self.dispersion_analyzer):
+                # 统一使用switch_to_monitor方法，减少重复代码
+                success = self.screen_manager.switch_to_monitor(monitor_index, self.homtrans, self.dispersion_analyzer)
+                if success:
                     self.calibration_data = self.homtrans.STransG
                     print(f"✓ 双屏校准成功！已将显示器 {monitor_index} 的校准结果应用到当前系统")
+                    return True
                 else:
                     print(f"✗ 双屏校准成功，但无法应用显示器 {monitor_index} 的校准结果")
+                    return False
         return success
     
     def load_calibration_data(self, interaction_mode, auto_select=False):
@@ -392,9 +498,10 @@ class EyeHandInteractionSystem:
                     print(f"正在加载校准文件: {calibration_file}")
                     
                     # 使用 homtransform 内置的方法来正确加载校准数据
-                    if self.homtrans.load_calibration_results(calibration_file):
+                    if self.homtrans.load_calibration_results(calibration_file, self.sfm_enabled):
                         self.calibration_data = self.homtrans.STransG
                         print("✓ 单屏校准数据加载成功！")
+
                         return True
                     else:
                         print("✗ 校准数据加载失败，将进行新校准")
@@ -416,8 +523,9 @@ class EyeHandInteractionSystem:
                     # 自动选择最佳显示器
                     monitor_index = self.screen_manager.auto_select_best_monitor()
                     if monitor_index is not None:
-                        # 切换到目标显示器
-                        if self.screen_manager.switch_to_monitor(monitor_index, self.homtrans, self.dispersion_analyzer):
+                        # 统一使用switch_to_monitor方法，避免重复调用
+                        success = self.screen_manager.switch_to_monitor(monitor_index, self.homtrans, self.dispersion_analyzer)
+                        if success:
                             self.calibration_data = self.homtrans.STransG
                             print(f"✓ 多屏校准数据加载成功！")
                             print(f"✓ 已加载 {len(self.screen_manager.calibration_results)} 个显示器的校准数据")
@@ -453,13 +561,19 @@ class EyeHandInteractionSystem:
         
         # 初始化屏幕边界信息
         self.screen_manager._update_screen_boundaries()
+        # 注视点分析切换到绝对坐标基准
+        self._configure_absolute_dispersion()
+        self.alpha = 0.8  # 平滑因子，越大越信任新值
+        self.previous_gaze_3d = None  # 保存上一次的gaze 3D数据
         
-        # 用于SfM的前一帧
-        frame_prev = None
-        current_gaze_point_rel = None  # 当前屏幕相对坐标注视点
+        # α-β滤波器参数（用于PnP delta_t平滑）
+        self.alpha_beta_filter_enabled = True  # 是否启用α-β滤波
+        self.alpha_beta_alpha = 0.7  # α参数，控制位置平滑
+        self.beta = 0.3  # β参数，控制速度平滑
+        self.delta_t_filtered = None  # 滤波后的delta_t
+        self.previous_delta_t = None  # 上一帧的delta_t
         current_gaze_point_abs = None  # 绝对坐标注视点
-        previous_gaze_point = None  # 用于快速移动检测
-        
+
         # 创建定时器用于更新界面（仅UI模式）
         if show_ui:
             timer = QTimer()
@@ -481,134 +595,112 @@ class EyeHandInteractionSystem:
             
             # 检测人脸和眼动
             try:
-                face_boxes = self.model.face_detection.predict(frame)
-                if not face_boxes:  # 如果没有检测到人脸
-                    eye_info = None
-                else:
-                    # 获取眼动信息
-                    try:
-                        eye_info = self.model.get_gaze(frame=frame, face_boxes=face_boxes, imshow=False)
-                    except Exception:
-                        eye_info = None
+                eye_info ,landmarks, pnp_info = self.model.get_gaze(frame=frame, imshow=False)
             except Exception:
-                face_boxes = None
                 eye_info = None
-            
+
             if eye_info is not None:
                 gaze = eye_info['gaze']
-                
-                # 使用SfM进行视线映射
+                if pnp_info['pnp_tvec'] is not None:
+                    tvec_curr = pnp_info['pnp_tvec']
+               
+                # 简化指数平均处理gaze三维数据（保持numpy数组格式）
+                if self.previous_gaze_3d is None:
+                    self.previous_gaze_3d = gaze.copy()
+
+                else:
+                    # 简单指数平均：当前值 = α * 新值 + (1-α) * 旧值（使用numpy保持数组格式）
+                    gaze = self.alpha * gaze + (1 - self.alpha) * self.previous_gaze_3d
+                    self.previous_gaze_3d = gaze.copy()
+
                 try:
-                    if frame_prev is not None:
-                        face_features_curr = self.model.get_FaceFeatures(frame, face_boxes=face_boxes)
-                        cached_prev_features = self.homtrans.sfm.get_cached_face_features('curr')
-                        if cached_prev_features is not None:
-                            face_features_prev = cached_prev_features
-                        else:
-                            face_features_prev = self.model.get_FaceFeatures(frame_prev, face_boxes=face_boxes)
-                        
-                        WTransG1, WTransG2, W_P = self.homtrans.sfm.get_GazeToWorld(
-                            self.model, frame_prev, frame, 
-                            face_features_prev=face_features_prev, 
-                            face_features_curr=face_features_curr
-                        )
-                        
-                        FSgaze, Sgaze, Sgaze2 = self.homtrans._getGazeOnScreen_sfm(gaze, WTransG1)
-                        self.homtrans.sfm.update_caches(
-                            frame_prev_features=face_features_prev,
-                            frame_curr_features=face_features_curr
-                        )
+                    if self.homtrans.calibrate_pnp is not None and tvec_curr is not None:
+                        delta_t = tvec_curr - self.homtrans.calibrate_pnp
+                        if self.alpha_beta_filter_enabled:
+                            delta_t_filtered = self._apply_alpha_beta_filter(delta_t)
+                            # 输出调试信息（可选）
+                            delta_t = delta_t_filtered
+                        delta_t=delta_t.flatten()
+                        SRW=[[1,0,0],[0,1,0],[0,0,-1]]
+
+                        delta_t=SRW @ delta_t 
+                        # 注释掉频繁输出
+                        # print(f"delta_t:{delta_t}")
+                        FSgaze, Sgaze, Sgaze2 = self.homtrans._getGazeOnScreen(gaze, delta_t)
                     else:
                         FSgaze, Sgaze, Sgaze2 = self.homtrans._getGazeOnScreen(gaze)
+                    
+
+                    
                     
                     # 使用main_pygame_dual_screen.py的注视点计算逻辑
                     if FSgaze is not None and len(FSgaze) >= 2:
                         # 将毫米坐标转换为像素坐标
                         screen_pos_mm = FSgaze.flatten()[:2]
                         screen_pos_px = self.homtrans._mm2pixel(screen_pos_mm)
+                        gaze_x = screen_pos_px[0]
+                        gaze_y = screen_pos_px[1]
+
+                        if self.homtrans.calibrate_pnp is not None and tvec_curr is not None:
+                            delta_t = tvec_curr - self.homtrans.calibrate_pnp
                         
+                            # 对delta_t进行α-β滤波
+                            if self.alpha_beta_filter_enabled:
+                                delta_t_filtered = self._apply_alpha_beta_filter(delta_t)
+                                # 输出调试信息（可选）
+                                delta_t = delta_t_filtered
+                        
+                            delta_screen_3d = self.homtrans.STransG[:3, :3] @ delta_t
+                                # 输出调试信息（可选）
+                            delta_mm = delta_screen_3d[:2].flatten()
+                            delta_px = self.homtrans._mm2pixel(delta_mm)
+                            gaze_x += delta_px[0]
+                            gaze_y += delta_px[1]   
+
+                        # gaze_x = max(0, min(gaze_x, self.screen_width))
+                        # gaze_y = max(0, min(gaze_y, self.screen_height))
                         # 计算绝对屏幕坐标（考虑显示器位置偏移）
+                        # gaze_x_abs = int(screen_pos_px[0] + monitor['x'])
+                        # gaze_y_abs = int(screen_pos_px[1] + monitor['y'])
+                        
+                        # 计算相对当前屏幕的坐标（作为转换基础）
+                        gaze_x_rel_original = gaze_x
+                        gaze_y_rel_original = gaze_y
+                        gaze_point_rel_original = (gaze_x_rel_original, gaze_y_rel_original)
+                        
+                        # a) 相对 -> 绝对
                         monitor = self.ui.monitors_info[self.screen_manager.current_monitor_index]
-                        gaze_x_abs = int(screen_pos_px[0] + monitor['x'])
-                        gaze_y_abs = int(screen_pos_px[1] + monitor['y'])
-                        
-                        # 计算相对当前屏幕的坐标
-                        # 原始相对坐标，不限制范围，用于手眼协调机制
-                        gaze_x_rel_original = screen_pos_px[0]
-                        gaze_y_rel_original = screen_pos_px[1]
-                        
-                        # 显示用相对坐标，限制在屏幕范围内，用于生成绿色渐变圆圈
-                        gaze_x_rel = max(0, min(screen_pos_px[0], self.ui.screen_width - 1))
-                        gaze_y_rel = max(0, min(screen_pos_px[1], self.ui.screen_height - 1))
-                        
-                        # 用于绿色渐变圆圈的绝对坐标，确保在屏幕内
-                        monitor = self.ui.monitors_info[self.screen_manager.current_monitor_index]
-                        self.fade_circle_x = int(gaze_x_rel + monitor['x'])
-                        self.fade_circle_y = int(gaze_y_rel + monitor['y'])
-                    
-                    # 应用卡尔曼滤波平滑算法 - 使用相对坐标进行平滑
-                    raw_gaze_point = (gaze_x_rel, gaze_y_rel)
+                        raw_abs_point = self._convert_rel_to_abs(gaze_point_rel_original, monitor)
 
-                    # 检查是否处于屏幕切换适应期
-                    if (hasattr(self, 'screen_switching_adaptation_frames') and 
-                        self.screen_switching_adaptation_frames > 0):
-                        # 在适应期内，返回原始坐标以避免卡尔曼滤波的拖拽效应
-                        gaze_point_rel = raw_gaze_point
-                        self.screen_switching_adaptation_frames -= 1
-                    else:
-                        # 使用卡尔曼滤波器平滑注视点
-                        gaze_point_rel = self._smooth_gaze_point(raw_gaze_point)
+                        # b) 绝对坐标卡尔曼滤波
+                        filtered_abs_point = self._smooth_absolute_point(raw_abs_point)
+                        current_gaze_point_abs = filtered_abs_point
+                        self.last_gaze_point_abs = filtered_abs_point
 
-                    current_gaze_point_rel = gaze_point_rel
+                        # 注视点分析器使用绝对坐标（统一桌面偏移）
+                        self._add_absolute_gaze_to_analyzer(filtered_abs_point)
 
-                    # 使用平滑后的相对坐标重新计算绝对坐标
-                    monitor = self.ui.monitors_info[self.screen_manager.current_monitor_index]
-                    smoothed_gaze_x_abs = int(gaze_point_rel[0] + monitor['x'])
-                    smoothed_gaze_y_abs = int(gaze_point_rel[1] + monitor['y'])
-                    current_gaze_point_abs = (smoothed_gaze_x_abs, smoothed_gaze_y_abs)
-                    self.last_gaze_point_abs = current_gaze_point_abs
-
-                    # 实时监测注视点位置，实现屏幕自动切换（仅在多屏模式下启用）
-                    if (not self.screen_switching and len(self.ui.monitors_info) > 1 and 
-                        hasattr(self, 'is_dual_screen_mode') and self.is_dual_screen_mode):
-                        # 检查注视点是否超出当前屏幕边界
-                        if self.screen_manager.is_gaze_out_of_screen(smoothed_gaze_x_abs, smoothed_gaze_y_abs, self.screen_manager.current_monitor_index):
-                            # 获取目标屏幕索引
-                            target_screen = self.screen_manager.get_target_screen(smoothed_gaze_x_abs, smoothed_gaze_y_abs)
-
-                            # 切换到目标屏幕
-                            if target_screen != self.screen_manager.current_monitor_index:
+                        # c) 5px 边界判定，触发屏幕切换
+                        if (not self.screen_switching and len(self.ui.monitors_info) > 1 and 
+                            hasattr(self, 'is_dual_screen_mode') and self.is_dual_screen_mode and
+                            self._is_near_screen_edge(filtered_abs_point, monitor, threshold=5)):
+                            target_screen = self._resolve_target_screen_from_point(filtered_abs_point, monitor, threshold=5)
+                            if target_screen is not None and target_screen != self.screen_manager.current_monitor_index:
                                 self.switch_to_monitor_with_coordinate_update(target_screen)
+                                monitor = self.ui.monitors_info[self.screen_manager.current_monitor_index]
 
-                                # 重新计算相对坐标
-                                gaze_x_rel, gaze_y_rel = self.screen_manager.convert_abs_to_rel_coordinate(
-                                    smoothed_gaze_x_abs, smoothed_gaze_y_abs, target_screen)
-                    
-                    # 手眼协调机制处理（使用原始相对坐标，不限制范围）
-                    # 创建原始相对坐标的卡尔曼滤波结果
-                    raw_gaze_point_original = (gaze_x_rel_original, gaze_y_rel_original)
-                    
-                    # 检查是否处于屏幕切换适应期
-                    if (hasattr(self, 'screen_switching_adaptation_frames') and 
-                        self.screen_switching_adaptation_frames > 0):
-                        # 在适应期内，返回原始坐标以避免卡尔曼滤波的拖拽效应
-                        gaze_point_rel_original = raw_gaze_point_original
-                        self.screen_switching_adaptation_frames -= 1
-                    else:
-                        # 使用卡尔曼滤波器平滑原始相对坐标
-                        gaze_point_rel_original = self._smooth_gaze_point(raw_gaze_point_original)
-                    
-                    # 传递原始相对坐标给手眼协调机制
-                    self.hand_eye_coordinator._process_hand_eye_coordination(gaze_point_rel_original, previous_gaze_point)
-                    
-                    # 更新前一注视点
-                    previous_gaze_point = current_gaze_point_rel
-                    
-                    # 添加到注视点分析器（使用相对坐标）
-                    self.dispersion_analyzer.add_gaze_point(gaze_point_rel[0], gaze_point_rel[1])
-                    
-                    # 检查触发条件
-                    triggered, center_point = self.dispersion_analyzer.check_trigger_conditions()
+                        # 显示用相对坐标：统一从绝对坐标回算并裁剪到屏幕范围
+                        smoothed_rel_point = self._convert_abs_to_rel(filtered_abs_point, monitor)
+                        display_rel_point = self._clamp_relative_to_monitor(smoothed_rel_point, monitor)
+                        self.fade_circle_x = int(display_rel_point[0] + monitor['x'])
+                        self.fade_circle_y = int(display_rel_point[1] + monitor['y'])
+
+                        # 确保视觉元素显示在屏幕内（显示坐标改为裁剪后的绝对值）
+                        current_gaze_point_abs = (self.fade_circle_x, self.fade_circle_y)
+                        self.last_gaze_point_abs = current_gaze_point_abs
+
+                        # 手眼协调使用平滑且裁剪后的相对坐标
+                        self.hand_eye_coordinator._process_hand_eye_coordination(display_rel_point)
                         
                 except Exception as e:
                     print(f"注视点处理失败: {e}")
@@ -617,9 +709,6 @@ class EyeHandInteractionSystem:
                     # 设置默认注视点，确保界面正常显示
                     monitor = self.ui.monitors_info[self.screen_manager.current_monitor_index]
                     current_gaze_point_abs = (monitor['x'] + monitor['width'] // 2, monitor['y'] + monitor['height'] // 2)
-            
-            # 获取离散度信息
-            dispersion_info = self.dispersion_analyzer.calculate_dispersion()
             
             # 更新交互界面（用于渐变圆圈）
             if show_ui:
@@ -700,8 +789,6 @@ class EyeHandInteractionSystem:
                 # 延迟一小段时间，避免连续触发
                 time.sleep(0.2)
             
-            # 更新前一帧
-            frame_prev = frame.copy()
             
         # 清理资源
         if timer:
@@ -717,3 +804,32 @@ class EyeHandInteractionSystem:
     def update_interaction_frame(self):
         """更新交互帧（由定时器调用）"""
         pass  # 界面更新在run_interaction_mode中处理
+
+    def _apply_alpha_beta_filter(self, current_delta_t):
+        """对一阶α-β滤波器应用于delta_t进行平滑"""
+        if self.previous_delta_t is None:
+            # 第一次初始化
+            self.delta_t_filtered = current_delta_t.copy()
+            self.previous_delta_t = current_delta_t.copy()
+            return current_delta_t
+        
+        # 计算速度（当前测量值 - 上一次测量值）
+        velocity = current_delta_t - self.previous_delta_t
+        
+        # α-β滤波预测
+        if self.delta_t_filtered is None:
+            predicted_delta_t = current_delta_t
+        else:
+            predicted_delta_t = self.delta_t_filtered + velocity
+        
+        # 更新（校正步骤）
+        measurement_residual = current_delta_t - predicted_delta_t
+        self.delta_t_filtered = predicted_delta_t + self.alpha_beta_alpha * measurement_residual
+        
+        # 更新速度估计
+        velocity_estimate = velocity + self.beta * measurement_residual
+        
+        # 保存当前状态用于下一帧
+        self.previous_delta_t = current_delta_t.copy()
+        
+        return self.delta_t_filtered

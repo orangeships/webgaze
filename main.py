@@ -1,30 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-眼手交互系统主入口
-
-该文件是眼手交互系统的主入口，负责初始化系统、显示菜单和启动交互模式。
-
-主要功能：
-1. 系统初始化和资源准备
-2. 主菜单显示和交互模式选择
-3. 校准流程启动
-4. 交互模式运行
-5. 系统资源释放和退出
-
-使用流程：
-1. 运行main.py启动系统
-2. 选择交互模式（单屏/多屏）
-3. 执行校准（如果需要）
-4. 进入交互模式
-5. 使用鼠标右键触发手眼协调机制  
-6. 按ESC键退出系统
-
-关键依赖：
-- PyQt5: 应用程序框架
-- core_system: 系统核心协调器
-
-"""
 import os
 import sys
 
@@ -50,7 +23,7 @@ def main():
         sys.exit(1)
     
     # 显示主菜单
-    interaction_mode, choice = system.show_menu()
+    interaction_mode, choice = system.show_menu() 
     
     if choice == 'calibrate':
         # 设置双屏模式标志
@@ -63,7 +36,7 @@ def main():
             print("校准成功，进入交互模式")
             # 运行交互模式
             system.run_interaction_mode()
-        else:
+        else: 
             print("校准失败或被用户取消")
     
     # 释放资源

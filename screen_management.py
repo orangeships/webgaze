@@ -33,6 +33,7 @@
 import os
 import json
 import cv2
+import numpy as np
 
 class ScreenManager:
     """屏幕管理类，负责多屏检测、切换和校准数据管理"""
@@ -58,6 +59,18 @@ class ScreenManager:
             top = monitor['y']
             bottom = monitor['y'] + monitor['height']
             self.screen_boundaries.append([left, right, top, bottom])
+
+    def _set_dispersion_global_dimensions(self, dispersion_analyzer):
+        """将离散度分析器的屏幕尺寸配置为整个桌面的绝对范围"""
+        if not self.ui or not getattr(self.ui, "monitors_info", None):
+            return
+        xs = [m['x'] for m in self.ui.monitors_info]
+        ys = [m['y'] for m in self.ui.monitors_info]
+        rights = [m['x'] + m['width'] for m in self.ui.monitors_info]
+        bottoms = [m['y'] + m['height'] for m in self.ui.monitors_info]
+        width = max(rights) - min(xs)
+        height = max(bottoms) - min(ys)
+        dispersion_analyzer.set_screen_dimensions(width, height)
     
     def _load_all_calibration_results(self):
         """加载所有显示器的校准结果"""
@@ -94,73 +107,86 @@ class ScreenManager:
             else:
                 print(f"未找到显示器 {monitor_index} 的校准文件")
     
-    def save_calibration_results(self, monitor_index):
-        """保存特定显示器的校准结果"""
+    # def save_calibration_results(self, monitor_index):
+    #     """保存特定显示器的校准结果"""
+    #     try:
+    #         # 获取校准结果
+    #         result = self.calibration_results[monitor_index]
+    #         homtrans = result['homtrans']
+            
+    #         # 直接保存校准结果到指定的文件名
+    #         calibration_filename = f"calibration_results_screen_{monitor_index}.json"
+            
+    #         homtrans._save_calibration_results(
+    #             result['STransG'],
+    #             homtrans.df if hasattr(homtrans, 'df') and homtrans.df is not None else [],
+    #             homtrans.SetVal if hasattr(homtrans, 'SetVal') else None,
+    #             homtrans.gaze if hasattr(homtrans, 'gaze') else None,
+    #             sfm=True,
+    #             STransW=homtrans.STransW if hasattr(homtrans, 'STransW') else None,
+    #             scaleWtG=homtrans.scaleWtG if hasattr(homtrans, 'scaleWtG') else None,
+    #             filename=calibration_filename
+    #         )
+            
+    #         print(f"显示器 {monitor_index} 的校准结果已保存到: calibration_results_screen_{monitor_index}.json")
+    #         return True
+            
+    #     except Exception as e:
+    #         print(f"保存显示器 {monitor_index} 校准结果失败: {e}")
+    #         import traceback
+    #         traceback.print_exc()
+    #         return False
+    
+    def _apply_calibration_to_homtrans(self, homtrans, calibration, monitor_index):
+        """将校准数据应用到指定的HomTransform实例
+        
+        Args:
+            homtrans: 目标HomTransform实例
+            calibration: 校准数据字典
+            monitor_index: 显示器索引
+            
+        Returns:
+            bool: 应用成功返回True，否则返回False
+        """
         try:
-            # 获取校准结果
-            result = self.calibration_results[monitor_index]
-            homtrans = result['homtrans']
-            
-            # 直接保存校准结果到指定的文件名
-            calibration_filename = f"calibration_results_screen_{monitor_index}.json"
-            
-            homtrans._save_calibration_results(
-                result['STransG'],
-                homtrans.df if hasattr(homtrans, 'df') and homtrans.df is not None else [],
-                homtrans.SetVal if hasattr(homtrans, 'SetVal') else None,
-                homtrans.gaze if hasattr(homtrans, 'gaze') else None,
-                sfm=True,
-                STransW=homtrans.STransW if hasattr(homtrans, 'STransW') else None,
-                scaleWtG=homtrans.scaleWtG if hasattr(homtrans, 'scaleWtG') else None,
-                filename=calibration_filename
-            )
-            
-            print(f"显示器 {monitor_index} 的校准结果已保存到: calibration_results_screen_{monitor_index}.json")
-            return True
-            
+            # 从校准数据中获取源HomTransform实例
+            if 'homtrans' in calibration:
+                source_homtrans = calibration['homtrans']
+                
+                # 复制所有校准相关属性
+                attributes_to_copy = [
+                    'STransG', 'scaleWtG', 'StG', 'StW', 'STransW', 
+                    'scaleWtG2', 'df', 'SetVal', 'gaze', 'calibrate_pnp'
+                ]
+                
+                for attr in attributes_to_copy:
+                    if hasattr(source_homtrans, attr):
+                        value = getattr(source_homtrans, attr)
+                        if value is not None:
+                            if attr == 'calibrate_pnp' and isinstance(value, (list, np.ndarray)):
+                                setattr(homtrans, attr, value.copy())
+                            else:
+                                setattr(homtrans, attr, value)
+                
+                print(f"✓ 已应用显示器 {monitor_index+1} 的校准数据")
+                return True
+            else:
+                print(f"✗ 显示器 {monitor_index+1} 的校准数据格式错误")
+                return False
+                
         except Exception as e:
-            print(f"保存显示器 {monitor_index} 校准结果失败: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"✗ 应用显示器 {monitor_index+1} 校准数据失败: {e}")
             return False
     
     def _apply_current_monitor_calibration(self, homtrans):
-        """应用当前显示器的校准数据"""
+        """应用当前显示器的校准数据 - 纯数据操作，无UI操作"""
         current_monitor_index = self.ui.current_monitor_index
-        target_monitor = self.ui.monitors_info[current_monitor_index]
         
         # 先尝试从已有的校准结果中应用
         if (current_monitor_index in self.calibration_results and 
             self.calibration_results[current_monitor_index] is not None):
             calibration = self.calibration_results[current_monitor_index]
-            
-            # 正确访问校准数据结构，从保存的homtrans实例复制属性
-            if hasattr(homtrans, 'STransG') and 'STransG' in calibration:
-                homtrans.STransG = calibration['STransG']
-            
-            # 从保存的HomTransform实例复制其他属性
-            source_homtrans = calibration['homtrans']
-            
-            # 设置其他必要属性
-            if hasattr(source_homtrans, 'scaleWtG'):
-                homtrans.scaleWtG = source_homtrans.scaleWtG
-            if hasattr(source_homtrans, 'StG'):
-                homtrans.StG = source_homtrans.StG
-            if hasattr(source_homtrans, 'StW'):
-                homtrans.StW = source_homtrans.StW
-            if hasattr(source_homtrans, 'STransW'):
-                homtrans.STransW = source_homtrans.STransW
-            if hasattr(source_homtrans, 'scaleWtG2'):
-                homtrans.scaleWtG2 = source_homtrans.scaleWtG2
-            if hasattr(source_homtrans, 'df') and source_homtrans.df is not None:
-                homtrans.df = source_homtrans.df
-            if hasattr(source_homtrans, 'SetVal'):
-                homtrans.SetVal = source_homtrans.SetVal
-            if hasattr(source_homtrans, 'gaze'):
-                homtrans.gaze = source_homtrans.gaze
-            
-            print(f"已应用显示器 {current_monitor_index+1} 的校准数据")
-            return homtrans.STransG
+            return self._apply_calibration_to_homtrans(homtrans, calibration, current_monitor_index)
         else:
             # 如果没有校准结果，尝试从文件加载
             calibration_file = os.path.join(self.project_dir, "results", 
@@ -171,35 +197,45 @@ class ScreenManager:
                     # 使用HomTransform内置的加载方法加载校准结果
                     if homtrans.load_calibration_results(calibration_file):
                         print(f"已从文件应用显示器 {current_monitor_index+1} 的校准数据")
-                        return homtrans.STransG
+                        return True
                     else:
                         print(f"加载显示器 {current_monitor_index+1} 校准数据失败: 内置加载方法返回False")
                         self.calibration_results[current_monitor_index] = None
+                        return False
                 except Exception as e:
                     print(f"加载显示器 {current_monitor_index+1} 校准数据失败: {e}")
                     self.calibration_results[current_monitor_index] = None
+                    return False
             else:
                 print(f"显示器 {current_monitor_index+1} 没有可用的校准文件")
-        
-        return None
+                return False
     
     def switch_to_monitor(self, monitor_index, homtrans, dispersion_analyzer):
-        """切换到指定显示器并加载对应的校准数据"""
+        """切换到指定显示器并加载对应的校准数据 - 简化版本"""
+        # 检查显示器索引是否有效
+        if monitor_index >= len(self.ui.monitors_info):
+            print(f"✗ 显示器索引 {monitor_index} 超出范围")
+            return False
+        
+        # 执行UI切换
         if self.ui.switch_to_monitor(monitor_index):
+            # 更新内部状态
             self.current_monitor_index = monitor_index
             
             # 更新屏幕尺寸用于角度计算
-            dispersion_analyzer.set_screen_dimensions(self.ui.screen_width, self.ui.screen_height)
+            self._set_dispersion_global_dimensions(dispersion_analyzer)
             
-            # 加载目标显示器的校准数据
-            calibration_data = self._apply_current_monitor_calibration(homtrans)
+            # 应用校准数据
+            success = self._apply_current_monitor_calibration(homtrans)
             
-            print(f"已切换到显示器 {monitor_index+1}")
-            return True
-        return False
+            print(f"✓ 已切换到显示器 {monitor_index+1}")
+            return success
+        else:
+            print(f"✗ 无法切换到显示器 {monitor_index+1}")
+            return False
     
     def switch_to_monitor_with_coordinate_update(self, target_screen, homtrans, dispersion_analyzer, kalman_filter=None):
-        """切换到目标屏幕并更新坐标系统 - 移植正确实现（单屏模式保护）
+        """切换到目标屏幕并更新坐标系统 - 优化版本
         
         Args:
             target_screen: 目标屏幕索引
@@ -217,63 +253,41 @@ class ScreenManager:
                 self.current_monitor_index = 0
             return False
             
+        # 检查是否已经是目标屏幕
         if target_screen == self.current_monitor_index or target_screen >= len(self.ui.monitors_info):
             return False
             
         try:
             self.screen_switching = True
             
-            # 保存当前状态
-            last_gaze_point = None  # 可以考虑从外部传入上一帧注视点
-            
-            # 关键修复：使用目标显示器的物理位置来设置窗口位置
+            # 获取目标显示器信息
             target_monitor = self.ui.monitors_info[target_screen]
-            window_pos_x = target_monitor['x']
-            window_pos_y = target_monitor['y']
             
-            # 重新初始化UI以适应当前显示器，同时确保窗口在正确位置
-            self.ui.initialize_display_at_position(target_monitor['x'], target_monitor['y'])
-            
-            # 关键修复：创建新的HomTransform实例以匹配目标显示器的分辨率
-            # 这与校准阶段的行为一致，确保视线计算使用正确的坐标系统
+            # 创建新的HomTransform实例以匹配目标显示器的分辨率
             from gaze_tracking.homtransform import HomTransform
             new_homtrans = HomTransform(self.project_dir, custom_width=target_monitor['width'], custom_height=target_monitor['height'])
             
             # 加载并应用对应屏幕的校准结果到新的HomTransform实例
             if target_screen in self.calibration_results:
                 calibration = self.calibration_results[target_screen]
-                
-                # 正确访问校准数据结构
-                new_homtrans.STransG = calibration['STransG']
-                
-                # 从 HomTransform 实例复制其他属性
-                source_homtrans = calibration['homtrans']
-                
-                # 设置其他必要属性
-                if hasattr(source_homtrans, 'scaleWtG'):
-                    new_homtrans.scaleWtG = source_homtrans.scaleWtG
-                if hasattr(source_homtrans, 'StG'):
-                    new_homtrans.StG = source_homtrans.StG
-                if hasattr(source_homtrans, 'StW'):
-                    new_homtrans.StW = source_homtrans.StW
-                if hasattr(source_homtrans, 'STransW'):
-                    new_homtrans.STransW = source_homtrans.STransW
-                if hasattr(source_homtrans, 'scaleWtG2'):
-                    new_homtrans.scaleWtG2 = source_homtrans.scaleWtG2
-                if hasattr(source_homtrans, 'df') and source_homtrans.df is not None:
-                    new_homtrans.df = source_homtrans.df
-                if hasattr(source_homtrans, 'SetVal'):
-                    new_homtrans.SetVal = source_homtrans.SetVal
-                if hasattr(source_homtrans, 'gaze'):
-                    new_homtrans.gaze = source_homtrans.gaze
-                
+                if not self._apply_calibration_to_homtrans(new_homtrans, calibration, target_screen):
+                    print(f"✗ 无法应用显示器 {target_screen+1} 的校准数据")
+                    self.screen_switching = False
+                    return False
             else:
                 # 如果没有校准结果，尝试从文件加载
                 calibration_file = os.path.join(self.project_dir, "results", f"calibration_results_screen_{target_screen}.json")
                 if os.path.exists(calibration_file):
-                    new_homtrans.load_calibration_results(calibration_file)
+                    if not new_homtrans.load_calibration_results(calibration_file):
+                        print(f"✗ 无法从文件加载显示器 {target_screen+1} 的校准数据")
+                        self.screen_switching = False
+                        return False
+                else:
+                    print(f"✗ 显示器 {target_screen+1} 没有可用的校准文件")
+                    self.screen_switching = False
+                    return False
             
-            # 关键修复：同步更新HomTransform的物理尺寸参数，确保_mm2pixel使用正确的屏幕尺寸
+            # 同步更新HomTransform的物理尺寸参数，确保_mm2pixel使用正确的屏幕尺寸
             new_homtrans.width = target_monitor['width']
             new_homtrans.height = target_monitor['height']
             
@@ -286,9 +300,9 @@ class ScreenManager:
                 self._update_screen_boundaries()
                 
                 # 更新屏幕尺寸用于离散度分析
-                dispersion_analyzer.set_screen_dimensions(target_monitor['width'], target_monitor['height'])
+                self._set_dispersion_global_dimensions(dispersion_analyzer)
                 
-                # 关键修复：重置卡尔曼滤波器状态，避免跨屏幕坐标混淆
+                # 重置卡尔曼滤波器状态，避免跨屏幕坐标混淆
                 if kalman_filter is not None:
                     # 重新初始化卡尔曼滤波器，清除旧状态
                     from gaze_analysis import LightweightKalmanFilter
@@ -306,7 +320,7 @@ class ScreenManager:
                 homtrans.__dict__.update(new_homtrans.__dict__)
                 
                 self.screen_switching = False
-                print(f"已切换到显示器 {target_screen+1}")
+                print(f"✓ 已切换到显示器 {target_screen+1}")
                 return True
             else:
                 self.screen_switching = False
@@ -434,7 +448,7 @@ class ScreenManager:
                 calibration_filename = f"calibration_results_screen_{i}.json"
                 
                 # 校准当前显示器
-                STransG = current_homtrans.calibrate(model, cap, sfm=True, filename=calibration_filename)
+                STransG = current_homtrans.calibrate(model, cap, sfm=False, filename=calibration_filename)
                 if STransG is not None:
                     # 关键修复：存储每个显示器的独立校准结果和对应实例
                     self.calibration_results[i] = {

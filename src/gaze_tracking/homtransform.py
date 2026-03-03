@@ -1,4 +1,5 @@
 import scipy.optimize as opt
+from scipy.spatial.transform import Rotation as R
 import cv2
 import os
 import keyboard
@@ -7,6 +8,7 @@ import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from timm.models.vovnet import OsaStage
 from gaze_tracking.calibration_pygame import PygameCalibrationUI, PygameCalibrationTargets, getScreenSize, getWhiteFrame, ReadCameraCalibrationData
 from sfm.sfm_module import SFM
 import utilities.utils as util
@@ -55,6 +57,7 @@ class HomTransform:
         self.StW = None  # 世界坐标变换矩阵列表，初始化为None
         self.SetVal = None  # 校准点值，初始化为None
         self.gaze = None  # 注视数据，初始化为None
+        self.calibrate_pnp = None  # PnP校准变换矩阵，初始化为None
     
     def _get_monitor_physical_size(self, target_width, target_height):
         """
@@ -292,7 +295,7 @@ class HomTransform:
 
     def calibrate(self, model, cap, sfm=False, display_index=0, filename=None):
         """
-        校准方法 - 仅使用Pygame界面
+        校准方法 - 使用Pygame界面进行校准
         
         Args:
             model: 视线估计模型
@@ -304,14 +307,7 @@ class HomTransform:
         Returns:
             STransG: 校准变换矩阵，如果取消则返回None
         """
-        if not PYGAME_AVAILABLE:
-            print("错误：Pygame未安装，无法进行校准")
-            return None
             
-        return self._calibrate_pygame(model, cap, sfm, display_index, filename)
-    
-    def _calibrate_pygame(self, model, cap, sfm=False, display_index=0, filename=None):
-        """Pygame版本的校准方法"""
         print(f"使用Pygame校准界面 (显示器索引: {display_index})...")
         
         # 初始化Pygame（如果尚未初始化）
@@ -337,12 +333,9 @@ class HomTransform:
         # 移除开始界面和点击等待，直接开始校准流程
         print("校准开始...")
         
-        # 模型预热阶段
-        print("模型预热中，请等待...")
         warmup_frames = 30
         stable_count = 0
         required_stable_frames = 10
-        frame_prev = None
         WTransG1 = np.zeros((4, 4))
         
         for i in range(warmup_frames):
@@ -350,7 +343,7 @@ class HomTransform:
                 ret, frame_cam = cap.read()
                 if ret:
                     # 测试模型输出
-                    eye_info = model.get_gaze(frame=frame_cam, imshow=False)
+                    eye_info, landmarks, pnp= model.get_gaze(frame=frame_cam, imshow=False)
                     if eye_info is not None:
                         stable_count += 1
                     else:
@@ -371,8 +364,6 @@ class HomTransform:
                     calib_ui.clock.tick(30)
             except Exception as e:
                 print(f"预热过程中出错: {e}")
-        
-        print("模型预热完成，显示预校准提示界面")
         
         # 显示预校准提示界面，等待用户按空格键开始
         calib_ui.show_precalibration_screen()
@@ -397,9 +388,13 @@ class HomTransform:
         calib_targets = PygameCalibrationTargets(self.width, self.height)
         calib_targets.start_timing()
         
+        # 初始化pnp_tvec和pnp_rotations收集列表，用于存储校准阶段的所有pnp数据
+        pnp_tvec_list = []
+        pnp_rotations_list = []
+        
         # 校准主循环
         valid_frames = 0
-        calib_time_per_point = 2.0  # 每个校准点停留时间
+        calib_time_per_point = 2.2  # 每个校准点停留时间
         
         while cap.isOpened():
             # 获取当前校准点
@@ -418,13 +413,9 @@ class HomTransform:
                     break
                 
                 # SfM处理
-                if frame_prev is not None and sfm:
-                    WTransG1, WTransG2, W_P = self.sfm.get_GazeToWorld(model, frame_prev, frame_cam)
-                
-                frame_prev = frame_cam.copy()
-                
                 # 获取视线信息
-                eye_info = model.get_gaze(frame=frame_cam, imshow=False)
+                eye_info, landmarks, pnp = model.get_gaze(frame=frame_cam, imshow=False)
+                # print(f"当前帧检测到的眼睛信息: {eye_info}，关键点形状: {landmarks.shape if landmarks is not None else 'None'}")
                 if eye_info is None:
                     print("当前帧未检测到眼睛信息，跳过...")
                     # 处理事件
@@ -433,8 +424,44 @@ class HomTransform:
                     calib_ui.clock.tick(60)
                     continue
                 
+                
+                
                 # 增加有效帧计数
                 valid_frames += 1
+                
+                # 收集pnp数据用于后续计算calibrate_pnp
+                if pnp is not None:
+                    # 收集pnp_tvec
+                    if 'pnp_tvec' in pnp:
+                        pnp_tvec = pnp['pnp_tvec']
+                        # 确保pnp_tvec是有效的numpy数组且形状为(3,1)
+                        if isinstance(pnp_tvec, np.ndarray) and pnp_tvec.shape == (3, 1):
+                            pnp_tvec_list.append(pnp_tvec)
+                        elif pnp_tvec is not None:
+                            # 如果不是(3,1)形状，尝试转换为标准格式
+                            try:
+                                pnp_tvec_arr = np.array(pnp_tvec)
+                                if pnp_tvec_arr.shape == (3,):
+                                    pnp_tvec_list.append(pnp_tvec_arr.reshape(3, 1))
+                                elif pnp_tvec_arr.ndim == 1 and len(pnp_tvec_arr) == 3:
+                                    pnp_tvec_list.append(pnp_tvec_arr.reshape(3, 1))
+                            except:
+                                pass
+                    
+                    # 收集pnp_rotations
+                    if 'pnp_R' in pnp:
+                        pnp_R = pnp['pnp_R']
+                        # 确保pnp_R是有效的numpy数组且形状为(3,3)
+                        if isinstance(pnp_R, np.ndarray) and pnp_R.shape == (3, 3):
+                            pnp_rotations_list.append(pnp_R)
+                        elif pnp_R is not None:
+                            # 如果不是(3,3)形状，尝试转换为标准格式
+                            try:
+                                pnp_R_arr = np.array(pnp_R)
+                                if pnp_R_arr.shape == (3, 3):
+                                    pnp_rotations_list.append(pnp_R_arr)
+                            except:
+                                pass
                 
                 # 只有在can_record为True时才记录校准数据（确保用户有足够时间注视目标）
                 if hasattr(calib_targets, 'can_record') and calib_targets.can_record:
@@ -446,9 +473,25 @@ class HomTransform:
                     else:
                         arr = np.zeros(19)
                     
+                    # 提取pnp_tvec和pnp_R
+                    pnp_arr = np.array([])
+                    if pnp is not None:
+                        pnp_tvec = pnp.get('pnp_tvec')
+                        pnp_R = pnp.get('pnp_R')
+                        if pnp_tvec is not None and isinstance(pnp_tvec, np.ndarray):
+                            pnp_arr = np.hstack((pnp_arr, pnp_tvec.flatten()))
+                        else:
+                            pnp_arr = np.hstack((pnp_arr, np.zeros(3)))
+                        if pnp_R is not None and isinstance(pnp_R, np.ndarray):
+                            pnp_arr = np.hstack((pnp_arr, pnp_R.flatten()))
+                        else:
+                            pnp_arr = np.hstack((pnp_arr, np.zeros(9)))
+                    else:
+                        pnp_arr = np.hstack((pnp_arr, np.zeros(3), np.zeros(9)))
+                    
                     timestamp = time.time_ns() / 1000000000
                     SetPos_mm = self._pixel2mm(SetPos)
-                    self.df = pd.concat([self.df, pd.DataFrame([np.hstack((timestamp, idx, arr, SetPos_mm, 0, WTransG1.flatten()))])])
+                    self.df = pd.concat([self.df, pd.DataFrame([np.hstack((timestamp, idx, arr, SetPos_mm, 0, pnp_arr, WTransG1.flatten()))])])
                 
             except Exception as e:
                 pass
@@ -462,36 +505,105 @@ class HomTransform:
         
         # 清理Pygame资源
         calib_ui.cleanup()
+        
+        # 计算calibrate_pnp：校准阶段收集到的所有pnp_tvec的均值
+        if len(pnp_tvec_list) > 0:
+            calibrate_pnp = np.mean(pnp_tvec_list, axis=0)
+            print(f"calibrate_pnp (pnp_tvec均值) 计算完成: {calibrate_pnp}")
+            print(f"收集到的pnp_tvec样本数: {len(pnp_tvec_list)}")
+        else:
+            calibrate_pnp = None
+            print("警告: 没有收集到有效的pnp_tvec数据，calibrate_pnp未定义")
+        if len(pnp_rotations_list) > 0:
+            print(f"收集到的pnp_R样本数: {len(pnp_rotations_list)}")
+        
         print("开始处理校准数据:")
-        print("self.df111111:", self.df)
         # 保存校准数据
-        self.df.columns = ['Timestamp', 'idx', 'gaze_x', 'gaze_y', 'gaze_z', 'REyePos_x', 'REyePos_y', 'LEyePos_x', 'LEyePos_y', 'yaw', 'pitch', 'roll', 'HeadBox_xmin', 'HeadBox_ymin', 'RightEyeBox_xmin', 'RightEyeBox_ymin', 'LeftEyeBox_xmin', 'LeftEyeBox_ymin', 'ROpenClose', 'LOpenClose', 'set_x', 'set_y', 'set_z'] + 16 * ['WTransG']
+        self.df.columns = ['Timestamp', 'idx', 'gaze_x', 'gaze_y', 'gaze_z', 'REyePos_x', 'REyePos_y', 'LEyePos_x', 'LEyePos_y', 'yaw', 'pitch', 'roll', 'HeadBox_xmin', 'HeadBox_ymin', 'RightEyeBox_xmin', 'RightEyeBox_ymin', 'LeftEyeBox_xmin', 'LeftEyeBox_ymin', 'ROpenClose', 'LOpenClose', 'set_x', 'set_y', 'set_z', 'pnp_tvec_x', 'pnp_tvec_y', 'pnp_tvec_z', 'pnp_R_00', 'pnp_R_01', 'pnp_R_02', 'pnp_R_10', 'pnp_R_11', 'pnp_R_12', 'pnp_R_20', 'pnp_R_21', 'pnp_R_22'] + 16 * ['WTransG']
         print("self.df:", self.df)
         self.df = self.df.reset_index(drop=True)
         self.df.to_csv(os.path.join(self.dir, "results", "Calibration.csv"))
         
         # 处理数据并计算变换矩阵
-        gaze, SetVal, WTransG, g = self._RemoveOutliers()
+        gaze, SetVal, WTransG, g, pnp_tvec_filtered, pnp_R_filtered = self._RemoveOutliers()
+        
+        # 尝试使用 fit_STW_with_pnp 计算 StW
+        st_w_from_pnp = None
+        
+        if not pnp_tvec_filtered.empty and not pnp_R_filtered.empty:
+            try:
+                # 准备数据格式
+                # calib_points_mm: 屏幕坐标 (N, 2)，单位 mm
+                calib_points_mm = SetVal.to_numpy()[:, :2]
+                
+                # gaze_vectors: 3D 注视单位向量 (N, 3)
+                gaze_vectors = gaze.to_numpy()
+                
+                # pnp_rotations: 头部旋转矩阵 (N, 3, 3)
+                pnp_cols_R = [f'pnp_R_{i}{j}' for i in range(3) for j in range(3)]
+                pnp_rotations = pnp_R_filtered[pnp_cols_R].to_numpy().reshape(-1, 3, 3)
+                
+                # pnp_translations: 头部平移向量 (N, 3)，单位 mm
+                pnp_translations = pnp_tvec_filtered.to_numpy()
+                
+                # 调试输出：各输入数据维度
+                print(f"[fit_STW_with_pnp 调试] calib_points_mm shape: {calib_points_mm.shape}")
+                print(f"[fit_STW_with_pnp 调试] gaze_vectors shape: {gaze_vectors.shape}")
+                print(f"[fit_STW_with_pnp 调试] pnp_rotations shape: {pnp_rotations.shape}")
+                print(f"[fit_STW_with_pnp 调试] pnp_translations shape: {pnp_translations.shape}")
+                
+                # 检查数据维度是否匹配
+                if (len(calib_points_mm) == len(gaze_vectors) == 
+                    len(pnp_rotations) == len(pnp_translations)):
+                    
+                    print(f"正在使用 fit_STW_with_pnp 计算 StW...")
+                    print(f"  有效样本数: {len(calib_points_mm)}")
+                    
+                    st_w_from_pnp = self.fit_STW_with_pnp(calib_points_mm, gaze_vectors, pnp_rotations, pnp_translations)
+                    print("fit_STW_with_pnp 计算完成!")
+                    print(f"  StW 计算结果:\n{st_w_from_pnp}")
+                else:
+                    print(f"数据维度不匹配: calib={len(calib_points_mm)}, gaze={len(gaze_vectors)}, R={len(pnp_rotations)}, t={len(pnp_translations)}")
+            except Exception as e:
+                print(f"fit_STW_with_pnp 调用失败: {e}")
+                import traceback
+                traceback.print_exc()
         
         if sfm:
             STransW, scaleWtG, STransG = self._fitSTransG_sfm(gaze, SetVal, WTransG, g)
         else:
             STransG = self._fitSTransG(gaze, SetVal, g)
         
-        Sg, SgCalib = self._getCalibValuesOnScreen(g, STransG)
+        # 如果从 fit_STW_with_pnp 获取了 StW，可以存储供后续使用
+        if st_w_from_pnp is not None:
+            self.StW_from_pnp = st_w_from_pnp
         
         # 绘制结果
+        # Sg, SgCalib = self._getCalibValuesOnScreen(g, STransG)
         # self._PlotGaze2D(g, Sg, SgCalib, name="GazeOnScreen")
         # self._WriteStatsInFile(STransG)
         
         # 保存校准结果
-        self._save_calibration_results(STransG, g, SetVal, gaze, sfm, STransW if sfm else None, scaleWtG if sfm else None, filename)
+        pnp_tvec_count = len(pnp_tvec_list) if len(pnp_tvec_list) > 0 else 0
+        self._save_calibration_results(STransG, g, SetVal, gaze, sfm, STransW if sfm else None, scaleWtG if sfm else None, calibrate_pnp, pnp_tvec_count, filename)
         
         return STransG
     
-    def _save_calibration_results(self, STransG, g, SetVal, gaze, sfm=False, STransW=None, scaleWtG=None, filename=None):
+    def _save_calibration_results(self, STransG, g, SetVal, gaze, sfm=False, STransW=None, scaleWtG=None, calibrate_pnp=None, pnp_tvec_count=0, filename=None):
         """
         保存完整的校准结果，包括设备信息和校准点数据（仅JSON格式）
+        
+        Args:
+            STransG: 屏幕到世界的变换矩阵
+            g: 校准注视数据
+            SetVal: 校准点数据
+            gaze: 注视数据
+            sfm: 是否使用SfM
+            STransW: SfM相关的世界坐标变换矩阵
+            scaleWtG: SfM缩放因子
+            calibrate_pnp: 校准阶段收集的pnp_tvec均值
+            pnp_tvec_count: 收集的pnp_tvec样本数量
+            filename: 指定文件名
         """
         import json
         import numpy as np
@@ -548,6 +660,13 @@ class HomTransform:
                 'StW': [stw.tolist() for stw in self.StW] if hasattr(self, 'StW') else []
             }
         
+        # 保存calibrate_pnp数据（校准阶段收集的pnp_tvec均值）
+        if calibrate_pnp is not None:
+            calibration_data['calibrate_pnp'] = {
+                'pnp_tvec_mean': convert_to_serializable(calibrate_pnp),
+                'pnp_tvec_samples_count': pnp_tvec_count
+            }
+        
         # 保存为JSON文件 - 支持指定文件名
         if filename:
             json_file = os.path.join(self.dir, "results", filename)
@@ -559,9 +678,13 @@ class HomTransform:
         
         print(f"校准结果已保存到: {json_file}")
 
-    def load_calibration_results(self, file_path=None):
+    def load_calibration_results(self, file_path=None, sfm_enabled=True):
         """
         从JSON文件加载校准结果
+        
+        Args:
+            file_path (str, optional): 校准文件路径，默认为标准路径
+            sfm_enabled (bool): 当前是否启用SfM模式，根据此参数决定是否加载SfM相关数据
         """
         import json
         import numpy as np
@@ -595,17 +718,34 @@ class HomTransform:
                 self.width_mm = 521
                 self.height_mm = 293
             
-            # 恢复SfM相关数据（如果存在）
-            if calibration_data['calibration_parameters']['sfm_enabled'] and 'sfm_data' in calibration_data:
+            # 根据当前SfM启用状态决定是否加载SfM相关数据
+            if sfm_enabled and 'sfm_data' in calibration_data:
                 self.STransW = np.array(calibration_data['sfm_data']['STransW'])
                 self.scaleWtG = calibration_data['sfm_data']['scaleWtG']
                 self.StW = [np.array(stw) for stw in calibration_data['sfm_data']['StW']]
+                sfm_loaded = True
+            elif sfm_enabled and 'sfm_data' not in calibration_data:
+                print("警告: 当前启用SfM，但校准文件中没有SfM数据")
+                sfm_loaded = False
+            else:
+                # 当前不启用SfM，不加载SfM相关数据
+                sfm_loaded = False
+            
+            # 加载calibrate_pnp数据（校准阶段收集的pnp_tvec均值）
+            if 'calibrate_pnp' in calibration_data:
+                self.calibrate_pnp = np.array(calibration_data['calibrate_pnp']['pnp_tvec_mean'])
+                print(f"calibrate_pnp 已加载: {self.calibrate_pnp}")
+                print(f"样本数量: {calibration_data['calibrate_pnp']['pnp_tvec_samples_count']}")
+            else:
+                self.calibrate_pnp = None
+                print("校准文件中没有 calibrate_pnp 数据")
             
             print(f"校准结果已从 {file_path} 加载")
             print(f"屏幕尺寸: {self.width}x{self.height}")
             print(f"物理尺寸: {self.width_mm}mmx{self.height_mm}mm")
             print(f"校准点数: {calibration_data['calibration_parameters']['total_calibration_points']}")
-            print(f"SfM启用: {calibration_data['calibration_parameters']['sfm_enabled']}")
+            print(f"当前SfM启用: {sfm_enabled}, SfM数据加载: {sfm_loaded}")
+            print(f"校准文件SfM状态: {calibration_data['calibration_parameters']['sfm_enabled']}")
             
             return True
             
@@ -613,7 +753,12 @@ class HomTransform:
             print(f"加载校准结果失败: {e}")
             return False
 
-    def _getGazeOnScreen(self, gaze):
+
+    def _getGazeOnScreen(self, gaze, fac=None):
+        Osg=self.STransG.copy()
+        if fac is not None:
+            self.STransG[:3,3] = self.STransG[:3,3] + fac
+
         scaleGaze = self._getScale(gaze, self.STransG)
         Sgaze = (self.STransG @ np.vstack((scaleGaze*gaze[:,None], 1)))[:3]
 
@@ -635,7 +780,9 @@ class HomTransform:
         Sgaze = overall gaze vector, determined over regression in screen coordinate system
         Sgaze2 = gaze vector from calibration point
         """
+        self.STransG = Osg.copy()
         return FSgaze, Sgaze, Sgaze2
+    
 
     def _getGazeOnScreen_sfm(self, gaze, WTransG):
         WTransG[:3,3] = self.scaleWtG*WTransG[:3,3]
@@ -656,12 +803,75 @@ class HomTransform:
 
         FSgaze = np.median(np.hstack((Sgaze, Sgaze2)), axis=1).reshape(3,1)
         """
-        FSgaze = fused gaze vector, overall and for each calibration point
-        Sgaze = overall gaze vector, determined over regression in screen coordinate system with head movement
-        Sgaze2 = gaze vector from calibration point with head movements
+        FSgaze = 融合后的注视向量，整体及各校准点均使用
+        Sgaze = 在屏幕坐标系下通过回归得到的整体注视向量，已考虑头部运动
+        Sgaze2 = 考虑头部运动后，从校准点得到的注视向量
         """
         return FSgaze, Sgaze, Sgaze2
       
+    def fit_STW_with_pnp(self, calib_points_mm, gaze_vectors, pnp_rotations, pnp_translations):
+        """
+        基于 PnP 物理尺度重写的 STW 矩阵回归函数 (即改进版的 _fitSTransG)
+        
+        参数:
+        calib_points_mm: 4个校准点的屏幕坐标 (N, 2)，单位 mm 
+        gaze_vectors: 模型输出的 3D 注视单位向量 (N, 3) 
+        pnp_rotations: PnP 计算得到的头部实时旋转矩阵 (N, 3, 3) 
+        pnp_translations: PnP 计算得到的头部物理平移向量 (N, 3)，单位 mm 
+        """
+        
+        def objective_function(x):
+            # x = [pitch, yaw, roll, tx, ty, tz]
+            # 前三个为相机相对于屏幕的旋转角度 (SRW)，后三个为平移偏置 (StW) [3, 9]
+            euler_angles = x[:3]
+            st_w = x[3:].reshape((3, 1))
+            
+            # 构造相机到屏幕的旋转矩阵 SRW
+            sr_w = R.from_euler('xyz', euler_angles).as_matrix()
+            
+            residuals = []
+            for i in range(len(calib_points_mm)):
+                # 获取 PnP 提供的当前帧头部数据 (W 坐标系下)
+                w_rg = pnp_rotations[i]
+                w_tg = pnp_translations[i].reshape((3, 1))
+                g_hat = gaze_vectors[i].reshape((3, 1))
+                
+                # 核心公式: Sg = SRW * (WRG * lambda * g_hat + WtG) + StW 
+                # 计算 lambda (注视线与屏幕 Z=0 平面的交点) 
+                # 为了使 Sg_z = 0: 
+                # sr_w[2,:] @ (w_rg @ (lambda * g_hat) + w_tg) + st_w = 0
+                
+                direction_w = w_rg @ g_hat
+                numerator = -(sr_w[2, :] @ w_tg + st_w[2])
+                denominator = sr_w[2, :] @ direction_w
+                
+                if abs(denominator) < 1e-6:
+                    lambda_i = 1000.0  # 避免除零
+                else:
+                    lambda_i = numerator / denominator
+                
+                # 计算预测的屏幕坐标 Sgi [35, Eq.25]
+                p_head_w = direction_w * lambda_i + w_tg
+                s_gi = sr_w @ p_head_w + st_w
+                
+                # 计算 x, y 方向的像素残差 (单位 mm) [26, Eq.9]
+                residuals.extend((s_gi[:2, 0] - calib_points_mm[i]).tolist())
+                
+            return np.array(residuals)
+
+        # 初始猜测: 假设相机镜像对齐，挂在屏幕上方 60cm 处 [11, 13]
+        # x0 = [pitch (180度), yaw, roll, tx (屏幕中心), ty, tz (深度)]
+        x0 = [np.pi, 0, 0, 300, -20, -600] 
+        
+        # 执行非线性最小二乘优化 [1, 2]
+        res = opt.least_squares(objective_function, x0, method='lm')
+        
+        # 封装为 4x4 齐次变换矩阵 STW [21, Eq.1]
+        final_stw = np.eye(4)
+        final_stw[:3, :3] = R.from_euler('xyz', res.x[:3]).as_matrix()
+        final_stw[:3, 3] = res.x[3:]
+        
+        return final_stw
 
     def _fitSTransG(self, gaze, SetVal, g):
         """
@@ -839,17 +1049,20 @@ class HomTransform:
         
         步骤：
         1. 获取最大校准点索引，确定需要处理的组数。
-        2. 对每一组数据，分别提取 gaze 向量、设定点坐标及世界变换矩阵。
+        2. 对每一组数据，分别提取 gaze 向量、设定点坐标、世界变换矩阵及PnP数据。
         3. 对 gaze 向量的 x、y、z 三个维度均调用 _MaskOutliers 进行异常值检测，
            只有三个维度都通过检测的样本才被保留，以提高校准精度。
-        4. 将过滤后的 gaze、设定点及变换矩阵分别存入列表。
-        5. 将各组合并，返回统一的 DataFrame 及分组列表，供后续拟合使用。
+        4. 对 pnp_tvec 和 pnp_R 也进行异常值检测。
+        5. 将过滤后的 gaze、设定点、变换矩阵及 pnp 数据分别存入列表。
+        6. 将各组合并，返回统一的 DataFrame 及分组列表，供后续拟合使用。
         
         返回:
             gaze:      过滤后的 gaze 向量 DataFrame（所有组合并）
             SetVal:    过滤后的设定点坐标 DataFrame（所有组合并）
             W_T_G:     过滤后的世界变换矩阵 DataFrame（所有组合并）
             g:         按组存放的 gaze 列表，每个元素为对应组的 DataFrame
+            pnp_tvec_filtered: 过滤后的 pnp_tvec DataFrame（所有组合并）
+            pnp_R_filtered:    过滤后的 pnp_R DataFrame（所有组合并）
         """
         # 计算总校准点数量（索引从 0 开始，因此最大索引+1）
         idx = int(pd.unique(self.df['idx'])[-1]) + 1  # 若考虑头部转动可改为 -3
@@ -858,6 +1071,8 @@ class HomTransform:
         g   = [None] * idx   # 存放 gaze 向量
         s   = [None] * idx   # 存放设定点坐标
         WTG = [None] * idx   # 存放世界变换矩阵
+        pnp_tvec = [None] * idx   # 存放 pnp_tvec
+        pnp_R = [None] * idx      # 存放 pnp_R
         
         # 按校准点索引分组处理
         for i in range(idx):
@@ -867,6 +1082,10 @@ class HomTransform:
             set_val = self.df[self.df['idx'].values == i].loc[:, 'set_x':'set_z']
             # 提取当前组的世界变换矩阵（列名包含 'WTransG'）
             WTG_ = self.df[self.df['idx'].values == i].filter(like='WTransG')
+            # 提取当前组的 pnp_tvec（pnp_tvec_x, pnp_tvec_y, pnp_tvec_z）
+            pnp_tvec_ = self.df[self.df['idx'].values == i].loc[:, 'pnp_tvec_x':'pnp_tvec_z']
+            # 提取当前组的 pnp_R（pnp_R_00 到 pnp_R_22）
+            pnp_R_ = self.df[self.df['idx'].values == i].filter(like='pnp_R_')
             
             # 对 gaze 的三个维度分别做异常值检测，取交集保留同时通过检测的样本
             mask = (
@@ -875,10 +1094,21 @@ class HomTransform:
                 self._MaskOutliers(g_.loc[:, 'gaze_z'])
             )
             
+            # 对 pnp_tvec 的三个维度做异常值检测
+            if not pnp_tvec_.empty and len(pnp_tvec_) > 0:
+                pnp_tvec_mask = (
+                    self._MaskOutliers(pnp_tvec_.loc[:, 'pnp_tvec_x']) &
+                    self._MaskOutliers(pnp_tvec_.loc[:, 'pnp_tvec_y']) &
+                    self._MaskOutliers(pnp_tvec_.loc[:, 'pnp_tvec_z'])
+                )
+                mask = mask & pnp_tvec_mask
+            
             # 应用掩码，保存过滤后的数据
             g[i]   = g_[mask]
             s[i]   = set_val[mask]
             WTG[i] = WTG_[mask]
+            pnp_tvec[i] = pnp_tvec_[mask] if not pnp_tvec_.empty else pd.DataFrame()
+            pnp_R[i] = pnp_R_[mask] if not pnp_R_.empty else pd.DataFrame()
         
         # 将设定点转换为 numpy 数组并存入实例变量，供后续绘图及评估使用
         self.SetValues = [v.to_numpy()[0][:, None] for v in s]
@@ -887,8 +1117,14 @@ class HomTransform:
         gaze   = pd.concat(g,   axis=0)
         SetVal = pd.concat(s,   axis=0)
         W_T_G  = pd.concat(WTG, axis=0)
+        pnp_tvec_filtered = pd.concat(pnp_tvec, axis=0) if all(v is not None and not v.empty for v in pnp_tvec) else pd.DataFrame()
+        pnp_R_filtered = pd.concat(pnp_R, axis=0) if all(v is not None and not v.empty for v in pnp_R) else pd.DataFrame()
         
-        return gaze, SetVal, W_T_G, g
+        # 存储过滤后的 pnp 数据到实例变量
+        self.pnp_tvec_filtered = pnp_tvec_filtered
+        self.pnp_R_filtered = pnp_R_filtered
+        
+        return gaze, SetVal, W_T_G, g, pnp_tvec_filtered, pnp_R_filtered
 
     def _MaskOutliers(self, arr, std_threshold=0.8):
         """

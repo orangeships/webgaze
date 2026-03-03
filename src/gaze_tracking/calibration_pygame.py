@@ -555,5 +555,8 @@ def get_out_video(cap, output_path, file_name = "calibrate.mp4", scalewidth = 1)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))    # get frame height in pixel
     # fps = int(cap.get(cv2.CAP_PROP_FPS))
     fps = 20
-    out_video = cv2.VideoWriter( os.path.join(output_path,file_name), cv2.VideoWriter_fourcc(*'avc1'), fps, (scalewidth*width, height))
+    # 确保输出尺寸是整数
+    output_width = int(scalewidth * width)
+    output_height = height
+    out_video = cv2.VideoWriter(os.path.join(output_path, file_name), cv2.VideoWriter_fourcc(*'avc1'), fps, (output_width, output_height))
     return out_video, width, height

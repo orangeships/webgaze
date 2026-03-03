@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+import matplotlib.animation as animation
 import os
 import datetime
 from gaze_tracking.model import EyeModel
@@ -9,8 +11,6 @@ from gaze_tracking.model import EyeModel
 from gaze_tracking.calibration_pygame import getScreenSize, getWhiteFrame, ReadCameraCalibrationData, get_out_video, PygameCalibrationTargets
 
 # Use Agg backend for canvas
-from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-import matplotlib.animation as animation
 
 from sfm.estimate_essential_matrix import estimateEssentialMatrix
 from sfm.decompose_essential_matrix import decomposeEssentialMatrix
@@ -19,13 +19,8 @@ from sfm.linear_triangulation import linearTriangulation
 from sfm.draw_camera import drawCamera
 # from sfm.utils import invHomMatrix, fit_plane, rotation_matrix_to_align_plane
 import utilities.utils as util
-plt.rcParams['font.sans-serif'] = [
-    # Windows 优先
-    'SimHei', 'Microsoft YaHei',
-]
-# 修复负号显示为方块的问题
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial'] 
 plt.rcParams['axes.unicode_minus'] = False
-plt.rcParams['font.family'] = 'SimHei' 
 
 class SFM():
 
@@ -37,12 +32,12 @@ class SFM():
         
         # 初始化缓存机制
         # 1. 人脸检测结果缓存
-        self.face_detection_cache_prev = None  # 上一帧人脸检测结果
-        self.face_detection_cache_curr = None  # 当前帧人脸检测结果
+        self.face_detection_cache_prev = None  # 上一帧人脸关键点检测结果
+        self.face_detection_cache_curr = None  # 当前帧人脸关键点检测结果
         
         # 2. SfM人脸关键点检测结果缓存
-        self.landmark_cache_prev = None  # 上一帧35点人脸关键点检测结果 (未畸变)
-        self.landmark_cache_curr = None  # 当前帧35点人脸关键点检测结果 (未畸变)
+        self.landmark_cache_prev = None  # 上一帧35点人脸关键点检测结果 (去畸变)
+        self.landmark_cache_curr = None  # 当前帧35点人脸关键点检测结果 (去畸变)
         
     def RunGazeOnScreen(self, model, cap):
 
@@ -163,256 +158,285 @@ class SFM():
 
 
     def sfm_video(self, model, video_path):
+        """
+        对输入视频进行 SfM 处理，生成 3D 点云、相机轨迹动画及可视化视频
+        """
         video_path = os.path.join(self.dir, video_path)
         cap = cv2.VideoCapture(video_path)
 
-        # 使用 get_out_video 函数来创建输出视频
+        # 输出视频
         from gaze_tracking.calibration_pygame import get_out_video
-        out_video,_,_ = get_out_video(cap, os.path.join(self.dir, "results"), file_name = "eye_features.mp4", scalewidth=2)
+        out_video, _, _ = get_out_video(
+            cap,
+            os.path.join(self.dir, "results"),
+            file_name="eye_features.mp4",
+            scalewidth=2
+        )
 
-        frame = None
-        # frame_prev = self.average_frame
         frame_prev = None
         W_P = None
 
-        fig = plt.figure()
-        # ax = fig.add_subplot(111, projection='3d')
+        # ============================
+        # 3D 可视化初始化
+        # ============================
+        fig = plt.figure(figsize=(6, 6))
+        ax = fig.add_subplot(111, projection='3d')
 
-        plots = []
+        # 固定坐标范围（防止抖动）
+        ax.set_xlim(-0.5, 0.5)
+        ax.set_ylim(-0.5, 0.5)
+        ax.set_zlim(0.0, 1.0)
+
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.view_init(elev=20, azim=-60)
+
+        # 世界坐标原点
+        ax.scatter(0, 0, 0, c='k', s=40)
+        ax.text(0, 0, 0, 'W')
+
+        plots = []      # ArtistAnimation 用
         df = pd.DataFrame()
-        dfT = pd.DataFrame() 
-        while cap.isOpened():            
-            try:
-                ret, frame = cap.read()
-            except Exception as e:
-                print(f"Could not read from video stream: {e}")
+        dfT = pd.DataFrame()
 
-            if ret == False:
+        # ============================
+        # 主循环
+        # ============================
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
                 break
 
             if frame_prev is not None:
-                # 预计算人脸特征点并更新缓存（与RunGazeOnScreen保持一致）
-                face_features_prev = model.get_FaceFeatures(frame_prev)
-                face_features_curr = model.get_FaceFeatures(frame)
-                
-                # 更新缓存
-                self.update_caches(frame_prev_features=face_features_prev, frame_curr_features=face_features_curr)
-                
-                # 使用缓存进行SfM处理
-                W_T_G1, W_T_G2, W_P = self.get_GazeToWorld(model, frame_prev, frame, 
-                                                          face_features_prev=face_features_prev, 
-                                                          face_features_curr=face_features_curr)
-                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-                df = pd.concat([ df, pd.DataFrame([np.hstack((timestamp, W_P.flatten(), np.median(W_P, axis=0))) ]) ])
-                dfT = pd.concat([ dfT, pd.DataFrame(W_T_G1) ])
+                face_prev = model.get_FaceFeatures(frame_prev)
+                face_curr = model.get_FaceFeatures(frame)
 
-                ax = fig.add_subplot(111, projection='3d')
-                # 修复坐标轴：交换x和y轴，使显示更自然
-                ax.scatter(W_P[:,1], W_P[:,2], W_P[:,0], marker = 'o')
-                # 交换相机位置和方向矩阵坐标（x和y交换）
-                camera_pos = np.array([W_T_G1[1,3], W_T_G1[2,3], W_T_G1[0,3]])
-                camera_dir = np.array([[W_T_G1[1,0], W_T_G1[1,1], W_T_G1[1,2]], 
-                                      [W_T_G1[2,0], W_T_G1[2,1], W_T_G1[2,2]], 
-                                      [W_T_G1[0,0], W_T_G1[0,1], W_T_G1[0,2]]])
-                drawCamera(ax, camera_pos, camera_dir, length_scale = 0.1)
-                # drawCamera(ax, W_T_G2[:3,3], W_T_G2[:3,:3], length_scale = 0.1)
-                drawCamera(ax, np.zeros(3), np.eye(3), length_scale = 0.1)
-                ax.text(-0.1,-0.1,-0.1,"W")
-                ax.set_xlabel('Y')
-                ax.set_ylabel('Z') 
-                ax.set_zlabel('X')
-                # ax.view_init(elev=80, azim=0)
-                            
-                plots.append([ax])
-                # plt.pause(0.001)
+                self.update_caches(
+                    frame_prev_features=face_prev,
+                    frame_curr_features=face_curr
+                )
+
+                W_T_G1, _, W_P = self.get_GazeToWorld(
+                    model,
+                    keypoints_prev=face_prev,
+                    keypoints_curr=face_curr
+                )
+                sy_WT = W_T_G1.copy()  # 保存原始变换矩阵用于显示
+                R_fix = np.array([
+                    [1,  0,  0],   # X 不变
+                    [0,  0,  1],   # Z → Y
+                    [0, -1,  0]    # -Y → Z（让脸朝前）
+                ])
+                # ========================
+                # 保存数据
+                # ========================
+                ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+                df = pd.concat([
+                    df,
+                    pd.DataFrame([[ts, *W_P.flatten(), *np.mean(W_P, axis=0)]])
+                ])
+                dfT = pd.concat([dfT, pd.DataFrame(W_T_G1.reshape(1, -1))])
+                W_P = (R_fix @ W_P.T).T
+
+                W_T_G1[:3, :3] = R_fix @ W_T_G1[:3, :3]
+                W_T_G1[:3,  3] = R_fix @ W_T_G1[:3,  3]
+                # ========================
+                # 每一帧重新创建 artist
+                # ========================
+                frame_artists = []
+
+                # 点云
+                sc = ax.scatter(
+                    W_P[:, 0],
+                    W_P[:, 1],
+                    W_P[:, 2],
+                    c='b',
+                    s=8
+                )
+                frame_artists.append(sc)
+
+                # 相机坐标轴
+                C = W_T_G1[:3, 3]
+                R = W_T_G1[:3, :3]
+                s = 0.1
+
+                lx, = ax.plot(
+                    [C[0], C[0] + s * R[0, 0]],
+                    [C[1], C[1] + s * R[1, 0]],
+                    [C[2], C[2] + s * R[2, 0]],
+                    'r', lw=2
+                )
+                ly, = ax.plot(
+                    [C[0], C[0] + s * R[0, 1]],
+                    [C[1], C[1] + s * R[1, 1]],
+                    [C[2], C[2] + s * R[2, 1]],
+                    'g', lw=2
+                )
+                lz, = ax.plot(
+                    [C[0], C[0] + s * R[0, 2]],
+                    [C[1], C[1] + s * R[1, 2]],
+                    [C[2], C[2] + s * R[2, 2]],
+                    'b', lw=2
+                )
+
+                frame_artists.extend([lx, ly, lz])
+
+                # ========================
+                # W_T_G1[:3,3] 可视化
+                # ========================
+                # 获取原始的平移向量（变换之前的）
+                tvec_w = W_T_G1[:3, 3]
+                
+                # 添加小标记点表示平移向量位置
+                marker = ax.scatter(
+                    [tvec_w[0]], 
+                    [tvec_w[1]], 
+                    [tvec_w[2]], 
+                    c='orange', 
+                    s=100, 
+                    marker='o',
+                    alpha=0.8
+                )
+                frame_artists.append(marker)
+
+                # 添加文本标签显示数值
+                text_label = ax.text(
+                    sy_WT[0, 3], sy_WT[1, 3], sy_WT[2, 3] ,
+                    f'W_T_G1: [{sy_WT[0, 3]:.3f}, {sy_WT[1, 3]:.3f}, {sy_WT[2, 3]:.3f}]',
+                    fontsize=8,
+                    color='orange',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7)
+                )
+                frame_artists.append(text_label)
+
+                plots.append(frame_artists)
+
+                # ========================
+                # 2D 投影可视化
+                # ========================
+                for p in W_P:
+                    I_P = self.camera_matrix @ p.reshape(3, 1)
+                    I_P /= I_P[2]
+                    cv2.drawMarker(
+                        frame,
+                        tuple(I_P[:2].astype(int).flatten()),
+                        (255, 0, 0),
+                        cv2.MARKER_CROSS,
+                        2
+                    )
 
             frame_prev = frame.copy()
-                
-            key_pressed = cv2.waitKey(1)
-            if key_pressed == 27:
-                # exit()
+
+            # ========================
+            # 输出视频
+            # ========================
+            if out_video is not None:
+                draw_frame = frame.copy()
+                p1 = model.get_FaceFeatures(draw_frame)
+                for i, p in enumerate(p1.T):
+                    cv2.drawMarker(
+                        draw_frame,
+                        tuple(p[:2].astype(int)),
+                        (255, 0, 0),
+                        cv2.MARKER_CROSS,
+                        1
+                    )
+                    cv2.putText(
+                        draw_frame,
+                        str(i),
+                        tuple(p[:2].astype(int)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4,
+                        (255, 255, 255),
+                        1
+                    )
+                out_video.write(cv2.hconcat([draw_frame, frame]))
+
+            if cv2.waitKey(1) == 27:
                 break
 
-            if W_P is not None:                
-                for p in W_P:
-                    I_P = self.camera_matrix @ p.reshape(3,1)
-                    I_P = I_P / I_P[2]
-                    WtG = self.camera_matrix @ W_T_G1[:3,3]
-                    WtG = WtG / WtG[2]
-                    x_axis = self.camera_matrix @ (W_T_G1[:3,3]+0.1*W_T_G1[:3,0])
-                    x_axis = x_axis / x_axis[2]
-                    y_axis = self.camera_matrix @ (W_T_G1[:3,3]+0.1*W_T_G1[:3,1])
-                    y_axis = y_axis / y_axis[2]
-                    z_axis = self.camera_matrix @ (W_T_G1[:3,3]+0.1*W_T_G1[:3,2])
-                    z_axis = z_axis / z_axis[2]
-                    cv2.drawMarker(frame, tuple(I_P.astype(int)[0:2].flatten()), color=(255,0,0), markerType=cv2.MARKER_CROSS, thickness=2) 
-                    cv2.drawMarker(frame, tuple(WtG.astype(int)[0:2].flatten()), color=(0,255,0), markerType=cv2.MARKER_CROSS, thickness=3) 
-                    cv2.line(frame, tuple(WtG.astype(int)[0:2].flatten()), tuple((x_axis).astype(int)[0:2].flatten()), color=(0,0,255), thickness=2)
-                    cv2.line(frame, tuple(WtG.astype(int)[0:2].flatten()), tuple((y_axis).astype(int)[0:2].flatten()), color=(0,255,0), thickness=2)
-                    cv2.line(frame, tuple(WtG.astype(int)[0:2].flatten()), tuple((z_axis).astype(int)[0:2].flatten()), color=(255,0,0), thickness=2)
-
-
-            window_name = "CalibWindow"
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)    
-            cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-            cv2.imshow(window_name, frame)
-
-            # draw_frame = frame_prev.copy()
-            draw_frame = frame.copy()
-            p1 = model.get_FaceFeatures(draw_frame)
-            for idx, p in enumerate(p1.T):
-                cv2.drawMarker(draw_frame, tuple(p.astype(int)[0:2].flatten()), color=(255,0,0), markerType=cv2.MARKER_CROSS, thickness=2)
-                cv2.putText(draw_frame, str(idx), tuple(p.astype(int)[0:2].flatten()), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-
-            if out_video is not None:      
-                # out_video.write(frame)
-                out_video.write(cv2.hconcat([draw_frame, frame]))
-            else:
-                print("No output video")
-
-        
         cap.release()
         cv2.destroyAllWindows()
-        ani = animation.ArtistAnimation(fig, plots)
-        # 修复动画时长：设置正确的fps匹配原视频
-        Writer = animation.writers['ffmpeg']
-        writer = Writer(fps=30, metadata=dict(artist='Me'), bitrate=1800)
-        ani.save(os.path.join(self.dir, "results", 'animation.mp4'), writer=writer)
-        
-        df.columns = ['timestamp(hh:m:s.ms)'] + ['W_Px', 'W_Py', 'W_Pz']*W_P.shape[0] + ['W_Px_mean', 'W_Py_mean', 'W_Pz_mean']
-        df = df.reset_index(drop=True)
-        df.to_csv(os.path.join(self.dir, "results", "W_P.csv"))
-        # Writer = animation.writers['ffmpeg']
-        # writer = Writer(fps=15, metadata=dict(artist='Me'), bitrate=1800)
-        # ani = animation.ArtistAnimation(fig, plots, interval=50, blit=True)
-        # ani.save(os.path.join(self.dir, "results", 'animation.mp4'), writer=writer)
-        dfT.to_csv(os.path.join(self.dir, "results", "W_T_G.csv"), index=False)
 
-        return dfT.to_numpy()
+        # ============================
+        # 生成动画（保证会动）
+        # ============================
+        ani = animation.ArtistAnimation(
+            fig,
+            plots,
+            interval=33,
+            blit=False
+        )
 
-    def sfm_image(self, model, image_path):
-        image_path = os.path.join(self.dir, image_path)
-        img_1 = np.array(cv2.imread(os.path.join(image_path, "im1.jpg")))
-        img_2 = np.array(cv2.imread(os.path.join(image_path, "im2.jpg")))
-
-        p1 = model.get_FaceFeatures(img_1)[:2,:]
-        p1 = cv2.undistortPoints(p1, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
-        p2 = model.get_FaceFeatures(img_2)[:2,:]
-        p2 = cv2.undistortPoints(p2, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
-
-        E = cv2.findEssentialMat(p1, p2, self.camera_matrix, method=cv2.RANSAC, prob=0.999, threshold=1.0)[0]
-        _, G2_R_G1, G2_t_G1, _= cv2.recoverPose(E, p1, p2, self.camera_matrix)    # C1 cosy is world coordinate system
-
-        M1 = self.camera_matrix @ np.eye(3,4)
-        M2 = self.camera_matrix @ np.c_[G2_R_G1, G2_t_G1]
-        points_4d_homogeneous = cv2.triangulatePoints(M1, M2, p1.T, p2.T)
-        W_P = cv2.convertPointsFromHomogeneous(points_4d_homogeneous.T).reshape(-1,3)   # 35x3
-        W_P = W_P/np.linalg.norm(W_P, axis=1)[:,np.newaxis]
-        W_P[W_P[:,2]<0] = W_P[W_P[:,2]<0]*(-1)
-
-        W_T_G1 = np.r_[np.c_[np.array([[1,0,0],[0,-1,0],[0,0,-1]]), np.mean(np.array([W_P[0,:],W_P[2,:]]), axis=0)[:,None]], np.array([[0,0,0,1]])]  
-
-        G1_T_G2 = np.r_[np.c_[G2_R_G1.T, -G2_R_G1.T @ G2_t_G1], np.array([[0,0,0,1]])]
-        W_T_G2 = W_T_G1 @ G1_T_G2       # not really useful
-
-        # Visualize the 3-D scene
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
-        ax.scatter(W_P[:,0], W_P[:,1], W_P[:,2], marker = 'o')
-        drawCamera(ax, W_T_G1[:3,3], W_T_G1[:3,:3], length_scale = 0.1)
-        drawCamera(ax, W_T_G2[:3,3], W_T_G2[:3,:3], length_scale = 0.1)
-        drawCamera(ax, np.zeros(3), np.eye(3), length_scale = 0.1)
-        ax.text(-0.1,-0.1,-0.1,"W")
+        ani.save(
+            os.path.join(self.dir, "results", "animation.mp4"),
+            writer='ffmpeg',
+            fps=30
+        )
 
         plt.show()
 
-    def get_GazeToWorld(self, model, frame_prev, frame, face_features_prev=None, face_features_curr=None):
+        # ============================
+        # 保存 CSV
+        # ============================
+        df.columns = (
+            ['timestamp'] +
+            ['W_Px', 'W_Py', 'W_Pz'] * W_P.shape[0] +
+            ['W_Px_mean', 'W_Py_mean', 'W_Pz_mean']
+        )
+        df.reset_index(drop=True, inplace=True)
+
+        df.to_csv(os.path.join(self.dir, "results", "W_P.csv"), index=False)
+        dfT.to_csv(os.path.join(self.dir, "results", "W_T_G.csv"), index=False)
+
+        return dfT.to_numpy()
+    
+    def get_GazeToWorld(self, pnp_tvec_curr=None, calibration_tvec=None):
         """
         获取从注视向量到世界坐标系的变换
         
         Args:
-            model: EyeModel实例
-            frame_prev: 上一帧图像
-            frame: 当前帧图像
-            face_features_prev: 可选，预计算的上一帧人脸特征点
-            face_features_curr: 可选，预计算的当前帧人脸特征点
+            pnp_tvec_curr: 当前帧的pnp平移向量，形状为 (3, 1)
+            pnp_tvec_prev: 上一帧的pnp平移向量，形状为 (3, 1) 
+            calibration_tvec: 标定时的第一个pnp平移向量，形状为 (3, 1)
             
         Returns:
-            W_T_G1: 从相机1(上一帧)到世界坐标系的变换矩阵
-            W_T_G2: 从相机2(当前帧)到世界坐标系的变换矩阵
-            W_P: 3D点云
+            W_T_G1: 从标定位置到世界坐标系的变换矩阵
+            W_T_G2: 从当前帧到世界坐标系的变换矩阵
+            W_P: 3D点云，形状为 (N, 3)（简化版本，返回空点云）
+
         """
         try:
-            # 优先使用传入的预计算特征点，否则使用缓存或重新计算
-            # 关键点：确保只有原始特征点需要去畸变，缓存的landmark已经是去畸变后的
-            if face_features_prev is not None:
-                # 使用传入的预计算特征点（原始坐标）
-                p1_original = face_features_prev[:2,:]
-                # 对原始特征点进行去畸变
-                p1_undistorted = cv2.undistortPoints(p1_original, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
-                # 更新缓存
-                self.face_detection_cache_prev = face_features_prev
-                self.landmark_cache_prev = p1_undistorted
-            elif self.landmark_cache_prev is not None:
-                # 使用缓存的已去畸变特征点，不需要再次去畸变
-                p1_undistorted = self.landmark_cache_prev
-            else:
-                # 重新计算特征点（原始坐标）
-                p1_original = model.get_FaceFeatures(frame_prev)[:2,:]
-                # 对原始特征点进行去畸变
-                p1_undistorted = cv2.undistortPoints(p1_original, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
-                # 更新缓存
-                self.face_detection_cache_prev = model.get_FaceFeatures(frame_prev)  # 保存完整结果用于缓存
-                self.landmark_cache_prev = p1_undistorted
             
-            # 当前帧处理同理
-            if face_features_curr is not None:
-                p2_original = face_features_curr[:2,:]
-                p2_undistorted = cv2.undistortPoints(p2_original, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
-                self.face_detection_cache_curr = face_features_curr
-                self.landmark_cache_curr = p2_undistorted
-            elif self.landmark_cache_curr is not None:
-                p2_undistorted = self.landmark_cache_curr
-            else:
-                p2_original = model.get_FaceFeatures(frame)[:2,:]
-                p2_undistorted = cv2.undistortPoints(p2_original, self.camera_matrix, self.dist_coeffs, P=self.camera_matrix).reshape(-1,2)
-                self.face_detection_cache_curr = model.get_FaceFeatures(frame)
-                self.landmark_cache_curr = p2_undistorted
+            # 计算当前tvec与标定tvec的差值
+            tvec_diff = pnp_tvec_curr - calibration_tvec
+            print(f"当前tvec: {pnp_tvec_curr.flatten()}")
+            print(f"标定tvec: {calibration_tvec.flatten()}")
+            print(f"tvec差值: {tvec_diff.flatten()}")
             
-            # 使用去畸变后的点进行后续计算
-            p1, p2 = p1_undistorted, p2_undistorted
-
-            E = cv2.findEssentialMat(p1, p2, self.camera_matrix, method=cv2.RANSAC, prob=0.999, threshold=1.0)[0]
-            _, G2_R_G1, G2_t_G1, _= cv2.recoverPose(E, p1, p2, self.camera_matrix)    # G1 cosy is world coordinate system
-
-            # Triangulate a point cloud using the final transformation (R,T)
-            M1 = self.camera_matrix @ np.eye(3,4)
-            M2 = self.camera_matrix @ np.c_[G2_R_G1, G2_t_G1]
-            points_4d_homogeneous = cv2.triangulatePoints(M1, M2, p1.T, p2.T)
-            W_P = cv2.convertPointsFromHomogeneous(points_4d_homogeneous.T).reshape(-1,3)   # 35x3
-
-            W_P = W_P/np.linalg.norm(W_P, axis=1)[:,np.newaxis]
-            W_P[W_P[:,2]<0] = W_P[W_P[:,2]<0]*(-1)      # if z<0, change sign of x,y,z
-
-            # rotation of face in 3d, however provided gaze vector is already rotated back so it aligns with world coordinate system
-            normal_vector,_ = util.fit_plane(W_P)
-            normal_vector = normal_vector/np.linalg.norm(normal_vector)
-            W_R_G1 = util.rotation_matrix_to_face(normal_vector, np.array([W_P[0,:],W_P[2,:],W_P[3,:],W_P[18,:]]) )
-            # print(f"W_R_G1\n{np.array2string(W_R_G1, formatter={'float': lambda x: f'{x:.2f}'})}")
-
-            # World is location of previous frame
-            WRotG = np.array([[1,0,0],[0,-1,0],[0,0,-1]])
-            W_T_G1 = np.r_[np.c_[WRotG, np.mean(np.array([W_P[0,:],W_P[2,:]]), axis=0)[:,None]], np.array([[0,0,0,1]])]
-            # W_T_G1 = np.r_[np.c_[W_R_G1, np.mean(np.array([W_P[0,:],W_P[2,:]]), axis=0)[:,None]], np.array([[0,0,0,1]])]  
-            G1_T_G2 = np.r_[np.c_[G2_R_G1.T, -G2_R_G1.T @ G2_t_G1], np.array([[0,0,0,1]])]
-            W_T_G2 = W_T_G1 @ G1_T_G2       # not really useful
-            if W_T_G2[2,3]<0:
-                W_T_G2[:3,3] = W_T_G2[:3,3]*(-1)
-
-            # W_T_G1[:2,3] = W_T_G1[:2,3]*(-1)    # flip x,y axis
-
+            # 构造W_T_G1（标定位置到世界坐标系）
+            W_T_G1 = np.array([
+                [1.0, 0.0, 0.0, tvec_diff[0, 0]],    # X轴不变
+                [0.0, -1.0, 0.0, tvec_diff[1, 0]], # Y轴翻转并取负
+                [0.0, 0.0, -1.0, tvec_diff[2, 0]],  # Z轴翻转
+                [0.0, 0.0, 0.0, 1.0]
+            ])
+            
+            # 构造W_T_G2（当前帧到世界坐标系）
+            # 同样包含坐标轴变换
+            W_T_G2 = np.array([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0]
+            ])
+            
+            # 生成简化的3D点云（返回空点云或默认值）
+            W_P = np.zeros((35, 3))  # 返回35个零点的点云
+            
             return W_T_G1, W_T_G2, W_P
+
         except Exception as e:
             print(f"Error in get_GazeToWorld: {e}")
             # 发生异常时返回默认值
@@ -452,8 +476,7 @@ class SFM():
         """
         self.face_detection_cache_prev = None
         self.face_detection_cache_curr = None
-        self.landmark_cache_prev = None
-        self.landmark_cache_curr = None
+
         
     def get_cached_face_features(self, frame_type='prev'):
         """
@@ -472,22 +495,7 @@ class SFM():
         else:
             return None
         
-    def get_cached_landmarks(self, frame_type='prev'):
-        """
-        获取缓存的去畸变后的关键点
-        
-        Args:
-            frame_type: 'prev' 或 'curr'
-            
-        Returns:
-            缓存的去畸变关键点，如果不存在则返回None
-        """
-        if frame_type == 'prev':
-            return self.landmark_cache_prev
-        elif frame_type == 'curr':
-            return self.landmark_cache_curr
-        else:
-            return None
+
 
 if __name__ == '__main__':
     dir = "C:\\temp\\WebCamGazeEstimation\\"
